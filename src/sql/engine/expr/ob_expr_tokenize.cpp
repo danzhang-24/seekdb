@@ -35,10 +35,22 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_json_func_helper.h" // file not self-contained, there're logs inside.
 
+#include <string>
+#include <unordered_map>
+
 namespace oceanbase
 {
 namespace sql
 {
+
+// Tokenize() is usually called with a constant parser name and constant
+// parser properties (very often empty). Rebuilding and re-serializing the
+// parser-property JSON on every call takes a write lock and shows up in the
+// tokenize hot path, so cache the reformed result per thread.
+namespace {
+constexpr size_t FT_PARSER_PROPS_CACHE_MAX = 64;
+thread_local std::unordered_map<std::string, std::string> g_ft_parser_props_cache;
+}
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -375,15 +387,41 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
-
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  std::string cache_key;
+  cache_key.reserve(parser_name_.length() + properties.length() + 1);
+  if (parser_name_.length() > 0) {
+    cache_key.append(parser_name_.ptr(), parser_name_.length());
+  }
+  cache_key.push_back('\0');
+  if (properties.length() > 0) {
+    cache_key.append(properties.ptr(), properties.length());
+  }
+  auto iter = g_ft_parser_props_cache.find(cache_key);
+  if (iter != g_ft_parser_props_cache.end()) {
+    const std::string &cached = iter->second;
+    char *buf = static_cast<char *>(allocator_.alloc(cached.size()));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate reformed parser properties", K(ret));
+    } else if (!cached.empty()) {
+      MEMCPY(buf, cached.data(), cached.size());
+    }
+    if (OB_SUCC(ret)) {
+      properties_.assign_ptr(buf, cached.size());
+    }
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else if (g_ft_parser_props_cache.size() < FT_PARSER_PROPS_CACHE_MAX) {
+      g_ft_parser_props_cache.emplace(std::move(cache_key),
+                                      std::string(properties_.ptr(), properties_.length()));
+    }
   }
 
   return ret;
