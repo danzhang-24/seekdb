@@ -19,6 +19,8 @@
 
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
+#include "lib/allocator/page_arena.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,10 +95,21 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
+
+// A dictionary that is shared by all the tokenize calls. The container holds
+// the kv cache handles that keep the data of the dictionary alive.
+struct ObFTSharedDict
+{
+  ObFTSharedDict() : dict_(nullptr), container_(nullptr) {}
+  ObIFTDict *dict_;
+  ObFTCacheRangeContainer *container_;
+};
+
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(), shared_dict_map_(), shared_dict_alloc_() {}
   ~ObFTDictHub() {}
 
   int init();
@@ -107,17 +120,36 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  /**
+   * Get the dictionary of the given description.
+   *
+   * The dictionary is built on the first call and is then shared by all the
+   * callers. It is read only once it has been built, so it can be used
+   * concurrently. Rebuilding the dictionary for every tokenize call is
+   * expensive, because the cache blocks have to be fetched from the kv cache
+   * and the range dictionary has to be rebuilt from them.
+   */
+  int get_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
+  int build_shared_dict(const ObFTDictDesc &desc, const ObFTDictInfoKey &key, ObIFTDict *&dict);
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  // holds the dictionaries that are shared by all the tokenize calls
+  hash::ObHashMap<ObFTDictInfoKey, ObFTSharedDict> shared_dict_map_;
+  // serializes the construction of the shared dictionaries
+  lib::ObMutex shared_dict_lock_;
+  // the shared dictionaries and the cache handles that keep their data alive
+  // are allocated from this allocator
+  ObArenaAllocator shared_dict_alloc_;
 };
 
 } //  namespace storage

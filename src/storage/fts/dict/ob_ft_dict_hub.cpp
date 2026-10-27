@@ -33,6 +33,7 @@ int ObFTDictHub::init()
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
   int ret = OB_SUCCESS;
   if (OB_FAIL(dict_map_.create(K_MAX_DICT_BUCKET, "dict_map"))) {
+  } else if (OB_FAIL(shared_dict_map_.create(K_MAX_DICT_BUCKET, "shared_dict_map"))) {
   } else if (OB_FAIL(rw_dict_lock_.init(K_MAX_DICT_BUCKET))) {
   } else {
     is_inited_ = true;
@@ -44,6 +45,17 @@ int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
   is_inited_ = false;
+  // release the kv cache handles of the shared dictionaries, the memory of the
+  // dictionaries themselves is released by the allocator
+  for (hash::ObHashMap<ObFTDictInfoKey, ObFTSharedDict>::iterator iter = shared_dict_map_.begin();
+       OB_SUCC(ret) && iter != shared_dict_map_.end();
+       ++iter) {
+    if (OB_NOT_NULL(iter->second.container_)) {
+      iter->second.container_->reset();
+    }
+  }
+  shared_dict_map_.destroy();
+  shared_dict_alloc_.reset();
   return ret;
 }
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
@@ -108,6 +120,74 @@ int ObFTDictHub::load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &c
         // dict not exist, make new one, by caller
       } else {
       }
+    }
+  }
+
+  return ret;
+}
+
+
+int ObFTDictHub::get_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTDictInfoKey key(static_cast<uint64_t>(desc.type_));
+  ObFTSharedDict shared;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(shared_dict_map_.get_refactored(key, shared))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = build_shared_dict(desc, key, dict);
+    }
+  } else if (OB_ISNULL(shared.dict_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    dict = shared.dict_;
+  }
+
+  return ret;
+}
+
+int ObFTDictHub::build_shared_dict(const ObFTDictDesc &desc,
+                                   const ObFTDictInfoKey &key,
+                                   ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTCacheRangeContainer *container = nullptr;
+  ObFTRangeDict *range_dict = nullptr;
+  ObFTSharedDict shared;
+
+  // only one thread builds the dictionary, the others wait for it and then use
+  // the dictionary that has been built
+  lib::ObMutexGuard guard(shared_dict_lock_);
+  if (OB_SUCC(shared_dict_map_.get_refactored(key, shared)) && OB_NOT_NULL(shared.dict_)) {
+    dict = shared.dict_;
+    return OB_SUCCESS;
+  }
+
+  if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer, &shared_dict_alloc_, shared_dict_alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(load_cache(desc, *container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      if (OB_FAIL(build_cache(desc, *container))) {
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict, &shared_dict_alloc_, shared_dict_alloc_, container, desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(range_dict->init())) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    shared.dict_ = range_dict;
+    shared.container_ = container;
+    if (OB_FAIL(shared_dict_map_.set_refactored(key, shared))) {
+    } else {
+      dict = range_dict;
     }
   }
 
