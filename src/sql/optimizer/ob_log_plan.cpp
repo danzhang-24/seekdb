@@ -12167,6 +12167,94 @@ int ObLogPlan::prepare_text_retrieval_merge(const ObIArray<ObRawExpr *> &merge_m
   return ret;
 }
 
+bool ObLogPlan::expr_contains_target(const ObRawExpr *expr, const ObRawExpr *target)
+{
+  bool bret = false;
+  if (OB_NOT_NULL(expr) && OB_NOT_NULL(target)) {
+    if (expr == target) {
+      bret = true;
+    } else {
+      for (int64_t i = 0; !bret && i < expr->get_param_count(); ++i) {
+        bret = expr_contains_target(expr->get_param_expr(i), target);
+      }
+    }
+  }
+  return bret;
+}
+
+// Returns true when the match expression is used as a value (its score is
+// needed), false when it only appears in a boolean predicate position.
+static bool match_expr_score_is_used(const ObRawExpr *expr, const ObRawExpr *match_expr)
+{
+  bool bret = false;
+  if (OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
+    bret = false;
+  } else if (expr == match_expr) {
+    bret = true;
+  } else if (T_OP_BOOL == expr->get_expr_type()
+             && 1 == expr->get_param_count()
+             && expr->get_param_expr(0) == match_expr) {
+    bret = false;
+  } else {
+    for (int64_t i = 0; !bret && i < expr->get_param_count(); ++i) {
+      bret = match_expr_score_is_used(expr->get_param_expr(i), match_expr);
+    }
+  }
+  return bret;
+}
+
+int ObLogPlan::check_match_expr_need_calc_score(ObMatchFunRawExpr *match_expr, bool &need_calc)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  const ObDMLStmt *stmt = get_stmt();
+  const ObSelectStmt *select_stmt = nullptr;
+  if (OB_ISNULL(match_expr) || OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null stmt or match expr", K(ret));
+  } else if (NATURAL_LANGUAGE_MODE != match_expr->get_mode_flag()) {
+    // Non-default match modes may rely on the match filter, keep relevance.
+  } else if (!stmt->is_select_stmt()) {
+    // Keep the conservative default for non-select statements.
+  } else {
+    select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    bool used_as_value = false;
+    for (int64_t i = 0; !used_as_value && i < select_stmt->get_select_item_size(); ++i) {
+      used_as_value = expr_contains_target(select_stmt->get_select_item(i).expr_, match_expr);
+    }
+    for (int64_t i = 0; !used_as_value && i < select_stmt->get_order_item_size(); ++i) {
+      used_as_value = expr_contains_target(select_stmt->get_order_items().at(i).expr_, match_expr);
+    }
+    for (int64_t i = 0; !used_as_value && i < select_stmt->get_group_expr_size(); ++i) {
+      used_as_value = expr_contains_target(select_stmt->get_group_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !used_as_value && i < select_stmt->get_rollup_expr_size(); ++i) {
+      used_as_value = expr_contains_target(select_stmt->get_rollup_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !used_as_value && i < select_stmt->get_having_expr_size(); ++i) {
+      used_as_value = expr_contains_target(select_stmt->get_having_exprs().at(i), match_expr);
+    }
+    if (!used_as_value) {
+      bool found_in_where = false;
+      bool boolean_only = true;
+      const ObIArray<ObRawExpr *> &conds = select_stmt->get_condition_exprs();
+      for (int64_t i = 0; OB_SUCC(ret) && boolean_only && i < conds.count(); ++i) {
+        if (expr_contains_target(conds.at(i), match_expr)) {
+          found_in_where = true;
+          if (match_expr_score_is_used(conds.at(i), match_expr)) {
+            boolean_only = false;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && found_in_where && boolean_only) {
+        need_calc = false;
+      }
+    }
+  }
+  LOG_TRACE("check match expr need calc score", K(ret), K(need_calc));
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
                                            const uint64_t index_table_id,
                                            ObMatchFunRawExpr *match_against,
@@ -12184,6 +12272,8 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
   bool need_calc_relevance = true;
+  bool skip_bm25_eval = false;
+  bool score_needed = true;
   ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
@@ -12192,6 +12282,9 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     || OB_ISNULL(schema_guard = get_optimizer_context().get_schema_guard())
     || OB_ISNULL(session = get_optimizer_context().get_session_info())) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(check_match_expr_need_calc_score(match_against, score_needed))) {
+    LOG_WARN("failed to check whether match score is needed", K(ret));
+  } else if (FALSE_IT(skip_bm25_eval = !score_needed)) {
   } else if (OB_FAIL(schema_guard->get_table_schema(
                                                     ref_table_id,
                                                     table_schema))) {
@@ -12271,6 +12364,7 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     tr_info.data_table_id_ = ref_table_id;
     tr_info.pushdown_match_filter_ = nullptr;
     tr_info.need_calc_relevance_ = need_calc_relevance;
+    tr_info.skip_bm25_eval_ = skip_bm25_eval;
   }
   return ret;
 }

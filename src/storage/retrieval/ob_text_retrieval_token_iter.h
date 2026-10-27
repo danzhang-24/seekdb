@@ -45,7 +45,8 @@ struct ObTextRetrievalScanIterParam
       relevance_expr_(nullptr),
       inv_scan_doc_length_col_(nullptr),
       inv_scan_domain_id_col_(nullptr),
-      inv_idx_agg_cache_mode_(false)
+      inv_idx_agg_cache_mode_(false),
+      skip_bm25_eval_(false)
   {}
 
   ObArenaAllocator *allocator_;
@@ -60,6 +61,7 @@ struct ObTextRetrievalScanIterParam
   sql::ObExpr *inv_scan_doc_length_col_;
   sql::ObExpr *inv_scan_domain_id_col_;
   bool inv_idx_agg_cache_mode_;
+  bool skip_bm25_eval_;
 };
 
 class ObTextRetrievalTokenIter final : public ObISparseRetrievalDimIter
@@ -115,6 +117,7 @@ private:
   ObDocIdExt advance_doc_id_;
   bool token_doc_cnt_calculated_;
   bool inv_idx_agg_cache_mode_;
+  bool skip_bm25_eval_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
@@ -156,6 +159,7 @@ private:
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
+  bool skip_bm25_eval_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
 };

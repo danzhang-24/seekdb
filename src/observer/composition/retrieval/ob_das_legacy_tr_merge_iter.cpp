@@ -367,6 +367,10 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
     iter_param.inv_scan_doc_length_col_ = ir_ctdef_->inv_scan_doc_length_col_;
     iter_param.inv_scan_domain_id_col_ = ir_ctdef_->inv_scan_domain_id_col_;
     iter_param.inv_idx_agg_cache_mode_ = function_lookup_mode_ && !taat_mode_;
+    // A pushed-down LIMIT uses top-k / block-max pruning, which needs the
+    // scores, so keep BM25 evaluation for that scan.
+    iter_param.skip_bm25_eval_ = ir_ctdef_->skip_bm25_eval()
+        && !ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_.is_valid();
   }
   return ret;
 }
