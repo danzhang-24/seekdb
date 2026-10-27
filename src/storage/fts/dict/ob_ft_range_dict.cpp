@@ -44,6 +44,24 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// Same ordering as ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, ...): the utf8mb4_bin
+// collation compares the raw bytes and uses the length as the tie breaker.
+inline int cmp_bin_word(const ObString &lhs, const ObString &rhs)
+{
+  const int64_t len = OB_MIN(lhs.length(), rhs.length());
+  int cmp = 0;
+  if (len > 0) {
+    cmp = MEMCMP(lhs.ptr(), rhs.ptr(), len);
+  }
+  if (0 != cmp) {
+    return cmp;
+  }
+  return static_cast<int>(lhs.length() - rhs.length());
+}
+} // namespace
+
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
 {
@@ -382,17 +400,38 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  if (use_binary_search_) {
+    // Find the last range whose first character is not greater than the word.
+    int64_t lo = 0;
+    int64_t hi = range_dicts_.size() - 1;
+    int64_t candidate = -1;
+    while (lo <= hi) {
+      const int64_t mid = lo + (hi - lo) / 2;
+      if (cmp_bin_word(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        candidate = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (candidate >= 0
+        && cmp_bin_word(range_dicts_[candidate].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[candidate].dict_;
       found = true;
+    }
+  } else {
+    for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+      if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                            range_dicts_[i].start_.get_word(),
+                            single_word)
+              <= 0
+          && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                               range_dicts_[i].end_.get_word(),
+                               single_word)
+                 >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -400,6 +439,21 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     ret = OB_ENTRY_NOT_EXIST;
   }
   return ret;
+}
+
+bool ObFTRangeDict::check_ranges_sorted() const
+{
+  bool sorted = true;
+  for (int64_t i = 1; OB_LIKELY(sorted) && i < range_dicts_.size(); ++i) {
+    const ObString &prev_start = range_dicts_[i - 1].start_.get_word();
+    const ObString &prev_end = range_dicts_[i - 1].end_.get_word();
+    const ObString &cur_start = range_dicts_[i].start_.get_word();
+    if (cmp_bin_word(prev_start, cur_start) > 0
+        || cmp_bin_word(prev_end, cur_start) >= 0) {
+      sorted = false;
+    }
+  }
+  return sorted;
 }
 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
@@ -421,6 +475,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    use_binary_search_ = check_ranges_sorted();
   }
   return ret;
 }

@@ -125,9 +125,20 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
-    TCWLockGuard guard(lock_);
-    if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
-      if (OB_HASH_NOT_EXIST == ret) {
+    // The hash map protects itself with an internal latch, so the hot lookup path
+    // does not need the outer write lock. The write lock is only taken when the
+    // loader has to be created, and it serializes the creation.
+    ret = dic_loader_map_.get_refactored(dic_loader_key, dic_loader);
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+      }
+    } else if (OB_HASH_NOT_EXIST == ret) {
+      TCWLockGuard guard(lock_);
+      ret = dic_loader_map_.get_refactored(dic_loader_key, dic_loader);
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+        }
+      } else if (OB_HASH_NOT_EXIST == ret) {
         if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
         } else if (OB_ISNULL(dic_loader)) {
           ret = OB_ERR_UNEXPECTED;
@@ -138,7 +149,8 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
       } else {
         ret = OB_ERR_UNEXPECTED;
       }
-    } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    } else {
+      ret = OB_ERR_UNEXPECTED;
     }
   }
   return ret;

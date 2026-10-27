@@ -25,6 +25,7 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
+#include "lib/utility/utility.h"
 
 namespace oceanbase
 {
@@ -1047,7 +1048,13 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        // The FTS aux table build is CPU bound on tokenization and on the sort of
+        // the generated rows. With the default DDL parallelism of one the other
+        // cores stay idle, so the decided parallelism has a floor of two. The
+        // floor is bounded by the number of usable CPUs so that a single core
+        // machine still builds the index with a single worker.
+        decided_parallelism = MAX(MAX(original_parallelism / 3, 1L),
+                                  MIN(2L, get_cpu_num()));
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
