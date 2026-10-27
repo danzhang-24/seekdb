@@ -786,6 +786,23 @@ int ObPluginVectorIndexAdaptor::fill_vector_index_info(ObVectorIndexInfo &info)
   return ret;
 }
 
+// [hipVS/cuVS] Switch a just-created index handle to the GPU-first mode: the CPU
+// VSAG HNSW graph is not built at all, the flat vector buffer is the CPU-side
+// index and the GPU CAGRA graph is the accelerator. Only dense L2 HNSW/HGRAPH
+// indexes without an extra-info payload qualify.
+static inline void ob_mark_cuvs_flat_if_needed(void *algo_data, void *handle)
+{
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
+  if (handle != nullptr && param != nullptr
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && param->extra_info_actual_size_ == 0
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
+    oceanbase::common::obvsag::mark_cuvs_index_flat(handle);
+  }
+}
+
 int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type)
 {
   INIT_SUCC(ret);
@@ -829,6 +846,8 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                       param->refine_type_,
                                                       param->bq_bits_query_,
                                                       param->bq_use_fht_))) {
+        } else {
+          ob_mark_cuvs_flat_if_needed(param, incr_data_->index_);
         }
       }
       if (OB_FAIL(ret)) {
@@ -920,6 +939,8 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
                                                param->refine_type_,
                                                param->bq_bits_query_,
                                                param->bq_use_fht_))) {
+        } else {
+          ob_mark_cuvs_flat_if_needed(param, snap_data_->index_);
         }
       }
 
@@ -977,6 +998,8 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
                                              param->refine_type_,
                                              param->bq_bits_query_,
                                              param->bq_use_fht_))) {
+      } else {
+        ob_mark_cuvs_flat_if_needed(param, snap_data_->index_);
       }
     }
 

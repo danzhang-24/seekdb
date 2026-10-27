@@ -184,6 +184,11 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 void mark_cuvs_index(void *key);
 void unmark_cuvs_index(void *key);
 
+// [hipVS/cuVS] GPU-first opt-in: like mark_cuvs_index, but the CPU VSAG HNSW
+// graph is not built at all. The flat vector buffer is the CPU-side index and
+// the GPU CAGRA graph is the accelerator.
+void mark_cuvs_index_flat(void *key);
+
 } // namesapce obvsag
 } // namespace common
 } // namespace oceanbase

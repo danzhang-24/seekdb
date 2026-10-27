@@ -17,9 +17,14 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
@@ -33,8 +38,17 @@
 #include "vsag/options.h"
 #include "vsag/factory.h"
 #include "lib/utility/ob_print_utils.h"
+#include "lib/utility/ob_target_specific.h"
 #include "lib/oblog/ob_log.h"
 #include "lib/worker.h"
+
+#if OB_USE_MULTITARGET_CODE
+#include <emmintrin.h>
+#include <immintrin.h>
+#include <tmmintrin.h>
+#include <smmintrin.h>
+#include <nmmintrin.h>
+#endif
 
 // [hipVS/cuVS] GPU vector-search bridge symbol, implemented in
 // libseekdb_cuvs_bridge.so (internally uses cuVS CAGRA on the GPU).
@@ -67,6 +81,15 @@ using namespace vsag;
 // handle) and knn_search serves top-k from the AMD GPU via hipVS libcuvs_c. This
 // runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
 // index, results allocated with the handle's allocator (drop-in with VSAG path).
+//
+// GPU-FIRST MODE (lib=cuvs): the GPU CAGRA graph is the primary index structure
+// and the CPU VSAG HNSW graph is NOT built. Building the VSAG graph on the CPU
+// dominates the end-to-end index build time (it is a sequential per-row graph
+// insertion), while the very same graph is built by cuVS CAGRA on the GPU. The
+// vectors are therefore kept in a flat row-major buffer, which doubles as an
+// EXACT CPU fallback for the cases the GPU cannot serve (top-k above the bridge
+// limit, row filters, deletes, a stale graph, or an unavailable GPU). An exact
+// fallback can only raise recall, never lower it.
 namespace {
 struct ObCuvsEntry {
   void *bridge_ = nullptr;      // opaque handle from seekdb_cuvs_build
@@ -75,8 +98,12 @@ struct ObCuvsEntry {
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+  bool flat_ = false;           // GPU-first: no VSAG HNSW graph, the buffer is the index
+  std::unordered_map<int64_t, int64_t> vid_map_;  // vid -> buffer row (exact distance path)
+  size_t vid_map_n_ = 0;        // #buffer rows covered by vid_map_
 };
-static std::mutex g_ob_cuvs_mu;
+static std::shared_mutex g_ob_cuvs_mu;
+static std::mutex g_ob_cuvs_vid_mu;  // protects ObCuvsEntry::vid_map_ (the vid -> row cache)
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
 static std::mutex g_ob_cuvs_marked_mu;
 static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
@@ -93,6 +120,17 @@ static inline bool ob_cuvs_marked(void *key) {
 #ifdef OB_BUILD_CUVS
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
   return g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end();
+#else
+  (void)key; return false;
+#endif
+}
+// GPU-first mode of a marked handle: the VSAG HNSW graph is not built and the
+// flat vector buffer is the CPU-side index.
+static inline bool ob_cuvs_flat(void *key) {
+#ifdef OB_BUILD_CUVS
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  return it != g_ob_cuvs_reg.end() && it->second->flat_;
 #else
   (void)key; return false;
 #endif
@@ -123,7 +161,7 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
   if (bridge == nullptr) { return; }
   ObCuvsEntry *ent = new ObCuvsEntry();
   ent->bridge_ = bridge; ent->dim_ = dim; ent->ids_.assign(ids, ids + size);
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot != nullptr) { seekdb_cuvs_free(slot->bridge_); delete slot; }
   slot = ent;
@@ -134,7 +172,7 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
 static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
                         int dim, int size) {
   if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
@@ -145,12 +183,400 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
 }
 static void ob_cuvs_erase(void *key) {
   { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it != g_ob_cuvs_reg.end()) {
     if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); }
     delete it->second; g_ob_cuvs_reg.erase(it);
   }
+}
+
+// ==== [hipVS/cuVS] exact CPU fallback over the flat vector buffer =========
+// The fallback reproduces the VSAG semantics exactly: squared L2 distance and
+// the filter rule "a row is valid iff reverse_filter ? test(vid) : !test(vid)"
+// (the same expression the GPU post-filter and ObVasgFilter use).
+//
+// The distance kernel is dispatched the same way the query engine dispatches
+// its own L2 kernel (see data_plane/ob_vector_l2_distance.h): a scalar default
+// plus SSE4.2 / AVX2 / AVX-512 variants selected at run time. The exact scan
+// is memory bound, so the SIMD width decides how close it gets to the memory
+// bandwidth of the machine.
+OB_DECLARE_DEFAULT_CODE(
+  inline static float ob_cuvs_l2_normal(const float *a, const float *b, int dim) {
+    float sum = 0.0f;
+    for (int i = 0; i < dim; ++i) { const float d = a[i] - b[i]; sum += d * d; }
+    return sum;
+  })
+
+OB_DECLARE_SSE42_SPECIFIC_CODE(
+  inline static float ob_cuvs_l2_sse42(const float *a, const float *b, int dim) {
+    __m128 sum = _mm_setzero_ps();
+    int i = 0;
+    for (; i + 4 <= dim; i += 4) {
+      const __m128 d = _mm_sub_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i));
+      sum = _mm_add_ps(sum, _mm_mul_ps(d, d));
+    }
+    float res = 0.0f;
+    if (i < dim) {
+      float buf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int j = i; j < dim; ++j) { buf[j - i] = a[j] - b[j]; }
+      const __m128 d = _mm_load_ps(buf);
+      sum = _mm_add_ps(sum, _mm_mul_ps(d, d));
+    }
+    float lanes[4];
+    _mm_storeu_ps(lanes, sum);
+    res = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    return res;
+  })
+
+OB_DECLARE_AVX2_SPECIFIC_CODE(
+  inline static float ob_cuvs_l2_avx2(const float *a, const float *b, int dim) {
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= dim; i += 8) {
+      const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+      sum = _mm256_fmadd_ps(d, d, sum);
+    }
+    float res = 0.0f;
+    if (i < dim) {
+      float buf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      for (int j = i; j < dim; ++j) { buf[j - i] = a[j] - b[j]; }
+      const __m256 d = _mm256_loadu_ps(buf);
+      sum = _mm256_fmadd_ps(d, d, sum);
+    }
+    __m128 half = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    half = _mm_hadd_ps(half, half);
+    half = _mm_hadd_ps(half, half);
+    res = _mm_cvtss_f32(half);
+    return res;
+  })
+
+OB_DECLARE_AVX512_SPECIFIC_CODE(
+  inline static float ob_cuvs_l2_avx512(const float *a, const float *b, int dim) {
+    __m512 sum = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= dim; i += 16) {
+      const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
+      sum = _mm512_fmadd_ps(d, d, sum);
+    }
+    float res = 0.0f;
+    if (i < dim) {
+      float buf[16] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                       0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      for (int j = i; j < dim; ++j) { buf[j - i] = a[j] - b[j]; }
+      const __m512 d = _mm512_loadu_ps(buf);
+      sum = _mm512_fmadd_ps(d, d, sum);
+    }
+    res = _mm512_reduce_add_ps(sum);
+    return res;
+  })
+
+static inline float ob_cuvs_l2(const float *a, const float *b, int dim) {
+#if OB_USE_MULTITARGET_CODE
+  if (common::is_arch_supported(ObTargetArch::AVX512)) {
+    return specific::avx512::ob_cuvs_l2_avx512(a, b, dim);
+  }
+  if (common::is_arch_supported(ObTargetArch::AVX2)) {
+    return specific::avx2::ob_cuvs_l2_avx2(a, b, dim);
+  }
+  if (common::is_arch_supported(ObTargetArch::SSE42)) {
+    return specific::sse42::ob_cuvs_l2_sse42(a, b, dim);
+  }
+#endif
+  return specific::normal::ob_cuvs_l2_normal(a, b, dim);
+}
+
+struct ObCuvsHit {
+  float dist;
+  int64_t vid;
+};
+
+// Cursor of an exact CPU scan. The scan is exact and totally ordered by
+// (distance, vid), so a resumed scan continues right after the last row the
+// caller consumed (the post-filter iterator mode of the plugin).
+struct ObCuvsFlatCursor {
+  uint64_t magic_;
+  float last_dist_;
+  int64_t last_vid_;
+  bool valid_;
+};
+static const uint64_t OB_CUVS_FLAT_CURSOR_MAGIC = 0x4f42435653464954ULL;
+static const char OB_CUVS_FLAT_MAGIC[8] = {'O', 'B', 'V', 'S', 'C', 'U', 'V', 'F'};
+static const uint32_t OB_CUVS_FLAT_VERSION = 1;
+
+static inline bool ob_cuvs_is_flat_cursor(void *ptr) {
+  if (ptr == nullptr) { return false; }
+  uint64_t magic = 0;
+  MEMCPY(&magic, ptr, sizeof(magic));
+  return magic == OB_CUVS_FLAT_CURSOR_MAGIC;
+}
+
+// Total order of the hits: distance first, vid as the tie breaker.
+static inline bool ob_cuvs_hit_less(const ObCuvsHit &a, const ObCuvsHit &b) {
+  if (a.dist != b.dist) { return a.dist < b.dist; }
+  return a.vid < b.vid;
+}
+
+// Keeps the `cap` nearest rows of [begin, end); the result is sorted ascending.
+static void ob_cuvs_range_topk(const float *vecs, const int64_t *vids,
+                               size_t begin, size_t end, int dim,
+                               const float *query, int64_t cap,
+                               FilterInterface *fi, bool reverse_filter,
+                               ObCuvsFlatCursor *cursor,
+                               std::vector<ObCuvsHit> &out)
+{
+  out.clear();
+  if (cap <= 0) { return; }
+  const auto worse = ob_cuvs_hit_less;
+  std::vector<ObCuvsHit> heap;
+  heap.reserve(static_cast<size_t>(cap) + 1);
+  for (size_t i = begin; i < end; ++i) {
+    const int64_t vid = vids[i];
+    if (fi != nullptr) {
+      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
+      if (!valid) { continue; }
+    }
+    ObCuvsHit hit;
+    hit.dist = ob_cuvs_l2(vecs + i * static_cast<size_t>(dim), query, dim);
+    hit.vid = vid;
+    if (cursor != nullptr && cursor->valid_) {
+      // Skip the rows the caller has already consumed: everything that sorts
+      // before the last row of the previous page.
+      if (hit.dist < cursor->last_dist_) { continue; }
+      if (hit.dist == cursor->last_dist_ && hit.vid <= cursor->last_vid_) { continue; }
+    }
+    heap.push_back(hit);
+    std::push_heap(heap.begin(), heap.end(), worse);
+    if (static_cast<int64_t>(heap.size()) > cap) {
+      std::pop_heap(heap.begin(), heap.end(), worse);
+      heap.pop_back();
+    }
+  }
+  out.swap(heap);
+  std::sort(out.begin(), out.end(), ob_cuvs_hit_less);
+}
+
+// Exact top-k over the flat buffer. The scan is memory bound, so a few worker
+// threads are enough to reach the memory bandwidth of the machine.
+static void ob_cuvs_flat_topk(const float *vecs, const int64_t *vids, size_t n, int dim,
+                              const float *query, int64_t cap,
+                              FilterInterface *fi, bool reverse_filter,
+                              ObCuvsFlatCursor *cursor,
+                              std::vector<ObCuvsHit> &out)
+{
+  out.clear();
+  if (n == 0 || cap <= 0 || dim <= 0) { return; }
+  // The scan is memory bound, so a handful of workers is enough to reach the
+  // memory bandwidth of the machine. More workers only add scheduling noise
+  // when several queries run concurrently.
+  int nthread = 1;
+  if (n >= 32768) {
+    nthread = static_cast<int>(n / 16384);
+    const unsigned hw = std::thread::hardware_concurrency();
+    int max_thread = (hw == 0) ? 4 : static_cast<int>(hw / 2);
+    if (max_thread > 8) { max_thread = 8; }
+    if (max_thread < 1) { max_thread = 1; }
+    if (nthread > max_thread) { nthread = max_thread; }
+    if (nthread < 1) { nthread = 1; }
+  }
+  if (nthread == 1) {
+    ob_cuvs_range_topk(vecs, vids, 0, n, dim, query, cap, fi, reverse_filter, cursor, out);
+    return;
+  }
+  std::vector<std::vector<ObCuvsHit>> parts(nthread);
+  std::vector<std::thread> threads;
+  threads.reserve(nthread);
+  const size_t chunk = (n + nthread - 1) / nthread;
+  for (int t = 0; t < nthread; ++t) {
+    const size_t begin = std::min(n, static_cast<size_t>(t) * chunk);
+    const size_t end = std::min(n, begin + chunk);
+    threads.emplace_back([&, t, begin, end]() {
+      ob_cuvs_range_topk(vecs, vids, begin, end, dim, query, cap, fi, reverse_filter, cursor, parts[t]);
+    });
+  }
+  for (auto &thread : threads) { thread.join(); }
+  out.reserve(static_cast<size_t>(cap) * nthread);
+  for (auto &part : parts) {
+    out.insert(out.end(), part.begin(), part.end());
+  }
+  std::sort(out.begin(), out.end(), ob_cuvs_hit_less);
+  if (static_cast<int64_t>(out.size()) > cap) { out.resize(cap); }
+}
+
+// Exact CPU fallback of a GPU-first (lib=cuvs) index.
+static bool ob_cuvs_flat_search(void *key, vsag::Allocator *alloc,
+                                const float *query, int dim, int64_t topk,
+                                const float *&dist, const int64_t *&ids,
+                                int64_t &result_size, void *filter, bool reverse_filter,
+                                ObCuvsFlatCursor *cursor)
+{
+  if (topk <= 0) { return false; }
+  // A shared lock: several exact scans may run concurrently, only a writer
+  // (add/erase/serialize) has to wait.
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end()) { return false; }
+  ObCuvsEntry *ent = it->second;
+  if (ent->buf_ids_.empty() || ent->dim_ <= 0) { return false; }
+  FilterInterface *fi = static_cast<FilterInterface *>(filter);
+  std::vector<ObCuvsHit> hits;
+  ob_cuvs_flat_topk(ent->buf_vecs_.data(), ent->buf_ids_.data(), ent->buf_ids_.size(),
+                    ent->dim_, query, topk, fi, reverse_filter, cursor, hits);
+  if (hits.empty()) { return false; }
+  const int64_t count = static_cast<int64_t>(hits.size());
+  int64_t *out_ids = static_cast<int64_t *>(
+      alloc ? alloc->Allocate(sizeof(int64_t) * count) : ::malloc(sizeof(int64_t) * count));
+  float *out_dist = static_cast<float *>(
+      alloc ? alloc->Allocate(sizeof(float) * count) : ::malloc(sizeof(float) * count));
+  if (out_ids == nullptr || out_dist == nullptr) {
+    if (alloc) { if (out_ids) { alloc->Deallocate(out_ids); } if (out_dist) { alloc->Deallocate(out_dist); } }
+    else { ::free(out_ids); ::free(out_dist); }
+    return false;
+  }
+  for (int64_t i = 0; i < count; ++i) {
+    out_ids[i] = hits[i].vid;
+    out_dist[i] = hits[i].dist;
+  }
+  ids = out_ids; dist = out_dist; result_size = count;
+  if (cursor != nullptr) {
+    cursor->last_dist_ = hits[count - 1].dist;
+    cursor->last_vid_ = hits[count - 1].vid;
+    cursor->valid_ = true;
+  }
+  ob_vsag_trace("flat_serve", key, static_cast<long>(topk), static_cast<long>(count));
+  return true;
+}
+
+// Number of rows held by the flat buffer of a GPU-first index.
+static int64_t ob_cuvs_flat_count(void *key) {
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  return it == g_ob_cuvs_reg.end() ? 0 : static_cast<int64_t>(it->second->buf_ids_.size());
+}
+
+// Smallest / largest vid held by the flat buffer of a GPU-first index.
+static int ob_cuvs_flat_vid_bound(void *key, int64_t &min_vid, int64_t &max_vid) {
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end() || it->second->buf_ids_.empty()) {
+    return OB_ERR_UNEXPECTED;
+  }
+  int64_t lo = it->second->buf_ids_[0];
+  int64_t hi = lo;
+  for (int64_t vid : it->second->buf_ids_) {
+    if (vid < lo) { lo = vid; }
+    if (vid > hi) { hi = vid; }
+  }
+  min_vid = lo;
+  max_vid = hi;
+  return OB_SUCCESS;
+}
+
+// Exact distances of the given vids over the flat buffer (-1 for a vid that
+// is not in the index, the same convention VSAG uses).
+static int ob_cuvs_flat_distances(void *key, vsag::Allocator *alloc, const float *query,
+                                  const int64_t *ids, int64_t count, const float *&distances)
+{
+  int ret = OB_SUCCESS;
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end()) { return OB_ERR_UNEXPECTED; }
+  ObCuvsEntry *ent = it->second;
+  if (ent->dim_ <= 0 || ids == nullptr || count <= 0) { return OB_ERR_UNEXPECTED; }
+  // The vid -> row cache is rebuilt lazily; it has its own mutex so that it does
+  // not have to downgrade the registry lock to an exclusive one.
+  std::lock_guard<std::mutex> vid_guard(g_ob_cuvs_vid_mu);
+  if (ent->vid_map_n_ != ent->buf_ids_.size()) {
+    ent->vid_map_.clear();
+    ent->vid_map_.reserve(ent->buf_ids_.size() * 2);
+    for (size_t i = 0; i < ent->buf_ids_.size(); ++i) {
+      ent->vid_map_[ent->buf_ids_[i]] = static_cast<int64_t>(i);
+    }
+    ent->vid_map_n_ = ent->buf_ids_.size();
+  }
+  float *out = static_cast<float *>(
+      alloc ? alloc->Allocate(sizeof(float) * count) : ::malloc(sizeof(float) * count));
+  if (out == nullptr) { return OB_ALLOCATE_MEMORY_FAILED; }
+  for (int64_t i = 0; i < count; ++i) {
+    auto row = ent->vid_map_.find(ids[i]);
+    out[i] = (row == ent->vid_map_.end())
+                 ? -1.0f
+                 : ob_cuvs_l2(ent->buf_vecs_.data() + static_cast<size_t>(row->second) * ent->dim_,
+                              query, ent->dim_);
+  }
+  distances = out;
+  return ret;
+}
+
+// Compact snapshot of a GPU-first index: magic | version | dim | n | ids | vectors.
+// The VSAG graph is not part of the snapshot (it lives on the GPU and is rebuilt
+// lazily), so the flat buffer is the whole persisted state of the index.
+static int ob_cuvs_flat_serialize(void *key, std::ostream &out)
+{
+  int ret = OB_SUCCESS;
+  std::shared_lock<std::shared_mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end()) { return OB_ERR_UNEXPECTED; }
+  ObCuvsEntry *ent = it->second;
+  const int64_t n = static_cast<int64_t>(ent->buf_ids_.size());
+  const int32_t dim = static_cast<int32_t>(ent->dim_);
+  const uint32_t version = OB_CUVS_FLAT_VERSION;
+  char header[24];
+  MEMCPY(header, OB_CUVS_FLAT_MAGIC, sizeof(OB_CUVS_FLAT_MAGIC));
+  MEMCPY(header + 8, &version, sizeof(version));
+  MEMCPY(header + 12, &dim, sizeof(dim));
+  MEMCPY(header + 16, &n, sizeof(n));
+  out.write(header, sizeof(header));
+  if (n > 0) {
+    out.write(reinterpret_cast<const char *>(ent->buf_ids_.data()),
+              static_cast<std::streamsize>(n * sizeof(int64_t)));
+    out.write(reinterpret_cast<const char *>(ent->buf_vecs_.data()),
+              static_cast<std::streamsize>(n * dim * sizeof(float)));
+  }
+  if (!out.good()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG] flat serialize stream failed", K(ret));
+  }
+  return ret;
+}
+
+static int ob_cuvs_flat_deserialize(void *key, std::istream &in)
+{
+  int ret = OB_SUCCESS;
+  uint32_t version = 0;
+  int32_t dim = 0;
+  int64_t n = 0;
+  in.read(reinterpret_cast<char *>(&version), sizeof(version));
+  in.read(reinterpret_cast<char *>(&dim), sizeof(dim));
+  in.read(reinterpret_cast<char *>(&n), sizeof(n));
+  if (!in.good() || version != OB_CUVS_FLAT_VERSION || dim <= 0 || n < 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG] flat deserialize header failed", K(ret), K(version), K(dim), K(n));
+    return ret;
+  }
+  std::vector<int64_t> ids(static_cast<size_t>(n));
+  std::vector<float> vecs(static_cast<size_t>(n) * static_cast<size_t>(dim));
+  if (n > 0) {
+    in.read(reinterpret_cast<char *>(ids.data()),
+            static_cast<std::streamsize>(n * sizeof(int64_t)));
+    in.read(reinterpret_cast<char *>(vecs.data()),
+            static_cast<std::streamsize>(n * dim * sizeof(float)));
+    if (!in.good()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[OBVSAG] flat deserialize payload failed", K(ret), K(n), K(dim));
+      return ret;
+    }
+  }
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
+  ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+  if (slot == nullptr) { slot = new ObCuvsEntry(); }
+  slot->flat_ = true;
+  slot->dim_ = dim;
+  slot->buf_ids_.swap(ids);
+  slot->buf_vecs_.swap(vecs);
+  slot->vid_map_.clear();
+  slot->vid_map_n_ = 0;
+  return ret;
 }
 struct ObCuvsJob {
   ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
@@ -231,7 +657,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *&dist, const int64_t *&ids,
                                int64_t &result_size, void *filter, bool reverse_filter) {
   if (topk <= 0) { return false; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return false; }
   ObCuvsEntry *ent = it->second;
@@ -487,6 +913,10 @@ int HnswIndexHandler::build_index(const vsag::DatasetPtr &base)
 
 int HnswIndexHandler::get_index_number()
 {
+  // GPU-first index: the flat buffer holds the rows, the VSAG graph is empty.
+  if (ob_cuvs_flat(this) && strcmp(get_metric(), "l2") == 0) {
+    return static_cast<int>(ob_cuvs_flat_count(this));
+  }
   return index_->GetNumElements();
 }
 
@@ -562,6 +992,9 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
 int HnswIndexHandler::get_vid_bound(int64_t &min_vid, int64_t &max_vid)
 {
   int ret = OB_SUCCESS;
+  if (ob_cuvs_flat(this) && strcmp(get_metric(), "l2") == 0) {
+    return ob_cuvs_flat_vid_bound(this, min_vid, max_vid);
+  }
   int64_t element_cnt = index_->GetNumElements();
   if (element_cnt == 0) {
   } else {
@@ -580,6 +1013,11 @@ uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool 
 {
 
   uint64_t size = 0;
+  if (ob_cuvs_flat(this) && strcmp(get_metric(), "l2") == 0) {
+    // GPU-first index: no VSAG graph, only the flat row-major vector buffer.
+    size = row_count * dim_ * sizeof(float) + row_count * sizeof(int64_t);
+    return size;
+  }
   if (IPIVF_TYPE == index_type_) {
     // TODO(ningxin.ning): use vsag EstimateMemory
     size += 2 * sizeof(int64_t) * row_count;
@@ -604,6 +1042,10 @@ uint64_t HnswIndexHandler::estimate_memory(const uint64_t row_count, const bool 
 int HnswIndexHandler::immutable_optimize()
 {
   int ret = OB_SUCCESS;
+  if (ob_cuvs_flat(this) && strcmp(get_metric(), "l2") == 0) {
+    // GPU-first index: there is no VSAG graph to freeze.
+    return OB_SUCCESS;
+  }
   if (index_type_ == IPIVF_TYPE) {
     // TODO(ningxin.ning): support SetImmutable for sparse vector index
   } else {
@@ -1237,6 +1679,15 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(vector_list), K(ids));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+    if (ob_cuvs_marked(index_handler) && strcmp(hnsw->get_metric(), "l2") == 0) {
+      ob_cuvs_add(index_handler, vector_list, ids, dim, size);
+      if (ob_cuvs_flat(index_handler)) {
+        // GPU-first: the CPU VSAG graph is not built, the flat buffer is the index.
+        LOG_INFO("[OBVSAG][cuVS] buffered vectors for the GPU CAGRA index",
+                 KP(index_handler), K(dim), K(size));
+        return OB_SUCCESS;
+      }
+    }
     DatasetPtr dataset = vsag::Dataset::Make();
     dataset->Dim(dim)
         ->NumElements(size)
@@ -1293,14 +1744,18 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
 {
   int ret = OB_SUCCESS;
   ob_vsag_trace("add_dense", (const void*)index_handler, (long)(dim), (long)(size));
-  if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
-      strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
-    ob_cuvs_add(index_handler, vector, ids, dim, size);
-  }
   if (index_handler == nullptr || vector == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", KP(index_handler), KP(vector), KP(ids));
   } else {
+    if (ob_cuvs_marked(index_handler) &&
+        strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
+      ob_cuvs_add(index_handler, vector, ids, dim, size);
+      if (ob_cuvs_flat(index_handler)) {
+        // GPU-first mode: the CPU graph is never built, the flat buffer is the index.
+        return OB_SUCCESS;
+      }
+    }
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     // add index
     DatasetPtr incremental = vsag::Dataset::Make();
@@ -1396,7 +1851,11 @@ int cal_distance_by_id(VectorIndexPtr &index_handler,
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    if (OB_FAIL(hnsw->cal_distance_by_id(vector, ids, count, distances))) {
+    if (ob_cuvs_flat(index_handler) && strcmp(hnsw->get_metric(), "l2") == 0) {
+      if (OB_FAIL(ob_cuvs_flat_distances(index_handler, hnsw->get_allocator(), vector,
+                                         ids, count, distances))) {
+      }
+    } else if (OB_FAIL(hnsw->cal_distance_by_id(vector, ids, count, distances))) {
     }
   }
   return ret;
@@ -1459,6 +1918,18 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
                              query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
         return OB_SUCCESS;
       }
+      if (ob_cuvs_flat(index_handler)) {
+        // GPU-first index: there is no CPU VSAG graph. When the GPU cannot serve
+        // the query (top-k above the bridge limit, a row filter or a stale
+        // graph), serve the EXACT result computed over the flat buffer.
+        if (ob_cuvs_flat_search(index_handler, cuvs_hnsw->get_allocator(),
+                                query_vector, dim, topk, dist, ids, result_size,
+                                invalid, reverse_filter, nullptr)) {
+          return OB_SUCCESS;
+        }
+        result_size = 0;
+        return OB_SUCCESS;
+      }
     }
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
@@ -1506,6 +1977,34 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
           ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
                              query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
+        return OB_SUCCESS;
+      }
+      if (ob_cuvs_flat(index_handler)) {
+        // GPU-first index, exact CPU fallback (see the non-iterator overload).
+        // The scan is ordered by (distance, vid), so the cursor resumes right
+        // after the last row the caller has consumed.
+        ObCuvsFlatCursor *cursor = nullptr;
+        if (iter_ctx == nullptr) {
+          cursor = new (std::nothrow) ObCuvsFlatCursor();
+          if (cursor == nullptr) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("[OBVSAG] failed to alloc flat cursor", K(ret));
+            return ret;
+          }
+          cursor->magic_ = OB_CUVS_FLAT_CURSOR_MAGIC;
+          cursor->last_dist_ = 0.0f;
+          cursor->last_vid_ = 0;
+          cursor->valid_ = false;
+          iter_ctx = cursor;
+        } else if (ob_cuvs_is_flat_cursor(iter_ctx)) {
+          cursor = static_cast<ObCuvsFlatCursor *>(iter_ctx);
+        }
+        if (ob_cuvs_flat_search(index_handler, cuvs_hnsw->get_allocator(),
+                                query_vector, dim, topk, dist, ids, result_size,
+                                invalid, reverse_filter, cursor)) {
+          return OB_SUCCESS;
+        }
+        result_size = 0;
         return OB_SUCCESS;
       }
     }
@@ -1579,6 +2078,11 @@ int fserialize(VectorIndexPtr &index_handler, std::ostream &out_stream)
   if (index_handler == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
+  } else if (ob_cuvs_flat(index_handler)) {
+    // GPU-first index: persist the flat buffer (the VSAG graph is empty).
+    if (OB_FAIL(ob_cuvs_flat_serialize(index_handler, out_stream))) {
+      LOG_WARN("[OBVSAG] flat fserialize failed", K(ret));
+    }
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     tl::expected<void, Error> bs = hnsw->get_index()->Serialize(out_stream);
@@ -1600,6 +2104,27 @@ int fdeserialize(VectorIndexPtr &index_handler,
   if (index_handler == nullptr) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
+  } else if (ob_cuvs_flat(index_handler)) {
+    // GPU-first index: the snapshot is the compact flat blob.
+    char magic[sizeof(OB_CUVS_FLAT_MAGIC)];
+    const std::istream::pos_type start = in_stream.tellg();
+    in_stream.read(magic, sizeof(magic));
+    if (!in_stream.good() || MEMCMP(magic, OB_CUVS_FLAT_MAGIC, sizeof(magic)) != 0) {
+      // Not a flat blob (e.g. an index persisted by an older build): rewind and
+      // let the VSAG deserializer handle it.
+      in_stream.clear();
+      if (start != std::istream::pos_type(-1)) { in_stream.seekg(start); }
+      HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+      tl::expected<void, Error> bs = hnsw->get_index()->Deserialize(in_stream);
+      if (bs.has_value()) {
+        LOG_INFO("[OBVSAG] deserialize index success");
+      } else {
+        ret = vsag_errcode2ob(bs.error().type);
+        LOG_WARN("[OBVSAG] fdeserialize error happend", K(ret), K(bs.error().type));
+      }
+    } else if (OB_FAIL(ob_cuvs_flat_deserialize(index_handler, in_stream))) {
+      LOG_WARN("[OBVSAG] flat fdeserialize failed", K(ret));
+    }
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     std::shared_ptr<vsag::Index> hnsw_index;
@@ -1681,7 +2206,12 @@ void delete_iter_ctx(void *iter_ctx)
 {
   LOG_TRACE("[OBVAG] delete_iter_ctx", KP(iter_ctx), K(lbt()));
   if (iter_ctx != nullptr) {
-    delete static_cast<vsag::IteratorContext *>(iter_ctx);
+    if (ob_cuvs_is_flat_cursor(iter_ctx)) {
+      // GPU-first index: the iterator context is a flat scan cursor.
+      delete static_cast<ObCuvsFlatCursor *>(iter_ctx);
+    } else {
+      delete static_cast<vsag::IteratorContext *>(iter_ctx);
+    }
     iter_ctx = nullptr;
   }
 }
@@ -1744,7 +2274,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
 {
   if (key == nullptr || queries == nullptr || out_ids == nullptr ||
       out_dist == nullptr || nq <= 0 || topk <= 0) { return 0; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return 0; }
   ObCuvsEntry *ent = it->second;
@@ -1794,15 +2324,28 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 }
 
 // [hipVS/cuVS] Per-index opt-in hooks called by the plugin for lib=cuvs indexes.
-void mark_cuvs_index(void *key) {
+// flat=true additionally switches the index to the GPU-first mode: the CPU VSAG
+// HNSW graph is never built, the flat vector buffer is the CPU-side index.
+static inline void ob_cuvs_mark(void *key, bool flat)
+{
 #ifdef OB_BUILD_CUVS
   if (key == nullptr) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  g_ob_cuvs_marked.insert(key);
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+    g_ob_cuvs_marked.insert(key);
+  }
+  if (flat) {
+    std::lock_guard<std::shared_mutex> guard(g_ob_cuvs_mu);
+    ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+    if (slot == nullptr) { slot = new ObCuvsEntry(); }
+    slot->flat_ = true;
+  }
 #else
-  (void)key;
+  (void)key; (void)flat;
 #endif
 }
+void mark_cuvs_index(void *key) { ob_cuvs_mark(key, false); }
+void mark_cuvs_index_flat(void *key) { ob_cuvs_mark(key, true); }
 void unmark_cuvs_index(void *key) {
 #ifdef OB_BUILD_CUVS
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
