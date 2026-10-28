@@ -23,6 +23,7 @@
 #include <vector>
 #include <memory>
 #include <limits>
+#include <unordered_map>
 #include <unistd.h>
 #include <istream>
 #include <ostream>
@@ -87,6 +88,10 @@ struct ObCuvsEntry {
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
+  // vid -> row index in buf_vecs_/buf_ids_. Lets cal_distance_by_id compute an
+  // exact distance straight from the flat buffer, so no CPU VSAG graph is needed.
+  std::unordered_map<int64_t, int64_t> vid_map_;
+  size_t vid_map_n_ = 0;        // #buffer rows covered by vid_map_
 };
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
@@ -184,6 +189,53 @@ static bool ob_cuvs_vsag_ready(void *key) {
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   return it != g_ob_cuvs_reg.end() && it->second->vsag_ready_;
+}
+// [hipVS/cuVS] Exact squared-L2 distance between a query and one buffered row.
+// Matches the VSAG L2 semantics (squared distance, no sqrt).
+static inline float ob_cuvs_l2(const float *a, const float *b, int dim) {
+  float sum = 0.0f;
+  for (int i = 0; i < dim; ++i) { const float d = a[i] - b[i]; sum += d * d; }
+  return sum;
+}
+// [hipVS/cuVS] Exact distances for a set of vids, computed straight from the flat
+// row-major buffer. This is the CPU-free alternative to VSAG's cal_distance_by_id:
+// the buffer already holds every row of a lib=cuvs index, so the exact distance can
+// be derived without ever building the CPU VSAG HNSW graph (which costs a
+// sequential per-row insertion over the whole dataset).
+// Returns OB_SUCCESS and fills `distances` when the index is a cuVS index with a
+// usable buffer; returns OB_ERR_UNEXPECTED otherwise so the caller can fall back.
+static int ob_cuvs_flat_distances(void *key, vsag::Allocator *alloc, const float *query,
+                                  const int64_t *ids, int64_t count, const float *&distances)
+{
+  int ret = OB_SUCCESS;
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end()) { return OB_ERR_UNEXPECTED; }
+  ObCuvsEntry *ent = it->second;
+  if (ent->dim_ <= 0 || ids == nullptr || count <= 0) { return OB_ERR_UNEXPECTED; }
+  if (ent->buf_ids_.empty()) { return OB_ERR_UNEXPECTED; }
+  // The vid -> row index is rebuilt lazily whenever the buffer grew.
+  if (ent->vid_map_n_ != ent->buf_ids_.size()) {
+    ent->vid_map_.clear();
+    ent->vid_map_.reserve(ent->buf_ids_.size() * 2);
+    for (size_t i = 0; i < ent->buf_ids_.size(); ++i) {
+      ent->vid_map_[ent->buf_ids_[i]] = static_cast<int64_t>(i);
+    }
+    ent->vid_map_n_ = ent->buf_ids_.size();
+  }
+  float *out = static_cast<float *>(
+      alloc ? alloc->Allocate(sizeof(float) * count) : ::malloc(sizeof(float) * count));
+  if (out == nullptr) { return OB_ALLOCATE_MEMORY_FAILED; }
+  for (int64_t i = 0; i < count; ++i) {
+    auto row = ent->vid_map_.find(ids[i]);
+    out[i] = (row == ent->vid_map_.end())
+                 ? -1.0f
+                 : ob_cuvs_l2(ent->buf_vecs_.data() + static_cast<size_t>(row->second) * ent->dim_,
+                              query, ent->dim_);
+  }
+  distances = out;
+  ob_vsag_trace("cuvs_flat_dist", key, static_cast<long>(count), static_cast<long>(ent->buf_ids_.size()));
+  return ret;
 }
 static void ob_cuvs_erase(void *key) {
   { std::lock_guard<std::mutex> mg(g_ob_cuvs_marked_mu); g_ob_cuvs_marked.erase(key); }
@@ -1696,6 +1748,18 @@ int cal_distance_by_id(VectorIndexPtr &index_handler,
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+    // [hipVS/cuVS] Serve the exact distances straight from the flat buffer. The
+    // buffer already holds every row of a lib=cuvs index, so this yields the same
+    // distances VSAG would return without building the CPU VSAG HNSW graph (a
+    // sequential per-row insertion over the whole dataset, which dominated the
+    // end-to-end index build). Only fall back to VSAG when the index is not a
+    // cuVS index or the buffer cannot answer the request.
+    if (ob_cuvs_marked(index_handler) && strcmp(hnsw->get_metric(), "l2") == 0) {
+      ret = ob_cuvs_flat_distances(index_handler, hnsw->get_allocator(), vector, ids, count, distances);
+      if (OB_SUCC(ret)) {
+        return ret;
+      }
+    }
     if (OB_FAIL(hnsw->ensure_vsag_fallback())) {
     } else if (OB_FAIL(hnsw->cal_distance_by_id(vector, ids, count, distances))) {
     }

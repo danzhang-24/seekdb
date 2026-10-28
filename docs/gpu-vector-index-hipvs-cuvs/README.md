@@ -96,6 +96,18 @@ See [`examples/batch_knn.sql`](examples/batch_knn.sql) for the table contract.
 
 ## Validation
 
+The end-to-end build-time comparison against the frozen V5 baseline (the
+CPU/GPU build performance report required by the submission) is reproduced
+with:
+
+```bash
+docs/gpu-vector-index-hipvs-cuvs/validation/run_build_perf_compare.sh \
+  <container> <dataset.tsv> 3 SIFT250K
+```
+
+The method, the measured window and the result table live in
+[`validation/build_perf_report.md`](validation/build_perf_report.md).
+
 The self-contained GPU smoke runner generates deterministic vectors and ground
 truth; it does not use private `/work/datasets` or `/work/bench` assets:
 
