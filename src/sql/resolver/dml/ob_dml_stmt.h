@@ -139,6 +139,7 @@ struct TableItem
     ref_query_ = NULL;
     is_system_table_ = true;
     is_recursive_union_fake_table_ = false;
+    is_file_table_ = false;
     cte_type_ = CTEType::NOT_CTE;
     type_ = BASE_TABLE;
     is_view_table_ = false;
@@ -222,6 +223,7 @@ struct TableItem
   bool is_has_sample_info() const { return sample_info_ != nullptr; }
   bool is_joined_table() const { return JOINED_TABLE == type_; }
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
+  bool is_file_table() const { return is_file_table_; }
   bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
 
@@ -280,6 +282,7 @@ struct TableItem
   bool is_index_table_; //just for index table resolver
   bool is_view_table_; //for VIEW privilege check
   bool is_recursive_union_fake_table_; //mark whether this table is a tmp fake table for resolve the recursive cte table
+  bool is_file_table_; //mark whether this table is a file table function, the columns are resolved from the file
   share::schema::ObTableType table_type_;
   CTEType cte_type_;
   common::ObString database_name_;

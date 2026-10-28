@@ -96,6 +96,16 @@ private:
                                 uint64_t &show_tg_id,
                                 ObString &show_table_name);
   int parse_and_resolve_select_sql(const common::ObString &select_sql);
+  int resolve_desc_select(const ParseNode &parse_tree, common::ObString &select_sql);
+  int collect_desc_columns(ObSelectStmt *inner_stmt,
+                            common::ObSEArray<common::ObString, 16> &names,
+                            common::ObSEArray<common::ObString, 16> &types,
+                            common::ObSEArray<bool, 16> &nullables);
+  int check_desc_select_priv(ObSelectStmt *inner_stmt);
+  int build_desc_select_sql(const common::ObSEArray<common::ObString, 16> &names,
+                             const common::ObSEArray<common::ObString, 16> &types,
+                             const common::ObSEArray<bool, 16> &nullables,
+                             common::ObString &select_sql);
   int resolve_like_or_where_clause(ObShowResolverContext &ctx);
   int replace_where_clause(ParseNode* expr_node, const ObShowResolverContext &show_resv_ctx);
   int process_select_type(

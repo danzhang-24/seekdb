@@ -18,6 +18,7 @@
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/expr/ob_shared_expr_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
+#include "lib/utility/utility.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -63,7 +64,11 @@ int ObSelectIntoItem::deep_copy(ObIAllocator &allocator,
   buffer_size_ = other.buffer_size_;
   user_vars_.assign(other.user_vars_);
   if (OB_FAIL(ob_write_string(allocator, other.external_properties_, external_properties_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, other.header_line_, header_line_))) {
+  } else if (!other.null_str_.is_null()
+             && OB_FAIL(deep_copy_obj(allocator, other.null_str_, null_str_))) {
   }
+  fail_if_exists_ = other.fail_if_exists_;
   for (int64_t i = 0; OB_SUCC(ret) && i < other.pl_vars_.count(); ++i) {
     ObRawExpr* pl_var;
     if (OB_FAIL(copier.copy(other.pl_vars_.at(i), pl_var))) {

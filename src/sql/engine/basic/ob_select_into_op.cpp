@@ -18,6 +18,8 @@
 
 #include <cmath>
 #include <memory>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "ob_select_into_op.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
@@ -38,7 +40,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, null_str_, header_line_, fail_if_exists_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -164,6 +166,7 @@ int ObSelectIntoOp::init_env_common()
                                                  file_name_,
                                                  need_check))) {
   } else if (OB_FAIL(calc_outfile_path())) {
+  } else if (MY_SPEC.fail_if_exists_ && OB_FAIL(check_target_file_not_exist())) {
   } else if (OB_FAIL(check_has_lob_or_json())) {
   } else if (has_coll_ && MY_SPEC.into_type_ == T_INTO_VARIABLES) {
     ret = OB_NOT_SUPPORTED;
@@ -227,9 +230,16 @@ int ObSelectIntoOp::inner_get_next_row()
   } //end while
   if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
+    if (T_INTO_OUTFILE == into_type && 0 == row_count && OB_NOT_NULL(data_writer)) {
+      /* the header line is written even if the query returns no row */
+      ObCsvFileWriter *csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer);
+      if (OB_FAIL(write_header_line(*csv_data_writer))) {
+      }
+    }
   }
   if (OB_FAIL(ret) && OB_ITER_END != ret) {
     need_commit_ = false;
+    has_error_ = true;
   }
   return ret;
 }
@@ -309,9 +319,16 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
   } //end while
   if (OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
+    if (T_INTO_OUTFILE == into_type && 0 == row_count && OB_NOT_NULL(data_writer)) {
+      /* the header line is written even if the query returns no row */
+      ObCsvFileWriter *csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer);
+      if (OB_FAIL(write_header_line(*csv_data_writer))) {
+      }
+    }
   }
   if (OB_FAIL(ret)) {
     need_commit_ = false;
+    has_error_ = true;
   }
   return ret;
 }
@@ -326,6 +343,39 @@ int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  }
+  if (OB_SUCC(ret) && has_error_ && MY_SPEC.fail_if_exists_) {
+    /* the file which is written by the failed statement is removed */
+    if (OB_FAIL(remove_target_file())) {
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::check_target_file_not_exist()
+{
+  int ret = OB_SUCCESS;
+  if (basic_url_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (0 == ::access(basic_url_.ptr(), F_OK)) {
+    ret = OB_FILE_ALREADY_EXIST;
+    LOG_USER_ERROR(OB_FILE_ALREADY_EXIST);
+  } else {
+    /* the file does not exist */
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::remove_target_file()
+{
+  int ret = OB_SUCCESS;
+  if (basic_url_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (0 != ::unlink(basic_url_.ptr())) {
+    const int err = errno;
+    LOG_WARN("failed to remove the file of the failed statement", K(basic_url_), K(err));
+  } else {
+    /* the file is removed */
   }
   return ret;
 }
@@ -929,7 +979,10 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
-  if (!has_escape_) {
+  if (obj.is_null() && !MY_SPEC.null_str_.is_null()) {
+    /* the text of the null value is written as it is */
+    OZ(write_obj_to_file(MY_SPEC.null_str_, data_writer, false));
+  } else if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
     OZ(write_single_char_to_file(&char_escape_, data_writer));
@@ -943,6 +996,19 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   return ret;
 }
 
+int ObSelectIntoOp::write_header_line(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  if (is_header_written_ || MY_SPEC.header_line_.is_null()) {
+    /* the statement does not write a header line */
+  } else {
+    OZ(write_obj_to_file(MY_SPEC.header_line_, data_writer, false));
+    OZ(write_obj_to_file(line_str_, data_writer));
+    is_header_written_ = true;
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
 {
   int ret = OB_SUCCESS;
@@ -952,6 +1018,7 @@ int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
   ObCsvFileWriter *csv_data_writer = NULL;
   if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(write_header_line(*csv_data_writer))) {
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_ISNULL(select_exprs.at(i))) {
@@ -992,6 +1059,10 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
   ObDatum *datum = NULL;
   ObObj obj;
   ObCsvFileWriter *csv_data_writer = NULL;
+  if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(write_header_line(*csv_data_writer))) {
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_FAIL(select_exprs.at(i)->eval_batch(eval_ctx_, *brs.skip_, brs.size_))) {
     } else if (OB_FAIL(datum_vectors.push_back(select_exprs.at(i)->locate_expr_datumvector(eval_ctx_)))) {

@@ -658,6 +658,11 @@ private:
       const int64_t schema_version,
       share::schema::ObSysVariableSchema &sys_variable_schema);
 
+  int mock_missed_sys_variable_schema(
+      share::schema::ObSysVariableSchema &sys_variable_schema,
+      const int64_t idx,
+      const int64_t schema_version);
+
   template<typename T>
   int retrieve_schema_version(T &result, int64_t &schema_version);
   // retrieve core table and sys table don't read history table, set check_deleted to false

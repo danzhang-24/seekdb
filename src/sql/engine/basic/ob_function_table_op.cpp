@@ -27,7 +27,8 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_,
+                    is_file_table_, column_indexes_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -36,6 +37,8 @@ int ObFunctionTableOp::inner_open()
   already_calc_ = false;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (MY_SPEC.is_file_table_) {
+    next_row_func_ = &ObFunctionTableOp::inner_get_next_row_file_table;
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -50,7 +53,13 @@ int ObFunctionTableOp::inner_rescan()
   if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
     node_idx_ = 0;
-    if (MY_SPEC.has_correlated_expr_) {
+    if (MY_SPEC.is_file_table_) {
+      if (OB_NOT_NULL(file_iterator_)) {
+        if (OB_FAIL(file_iterator_->reset())) {
+          LOG_WARN("fail to reset the file table iterator", K(ret));
+        }
+      }
+    } else if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
       col_count_ = 0;
       value_table_ = NULL;
@@ -67,6 +76,12 @@ int ObFunctionTableOp::inner_close()
   row_count_ = 0;
   col_count_ = 0;
   value_table_ = NULL;
+  if (OB_NOT_NULL(file_iterator_)) {
+    file_iterator_->~ObFileScanIterator();
+    file_iterator_ = NULL;
+  }
+  file_values_.reset();
+  file_allocator_.reset();
   return ret;
 }
 
@@ -212,6 +227,102 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
   } else {
     MY_SPEC.column_exprs_.at(0)->locate_datum_for_write(eval_ctx_).set_datum(*value);
     MY_SPEC.column_exprs_.at(0)->set_evaluated_projected(eval_ctx_);
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::set_file_table_column_value(ObExpr *expr, const ObFileValue &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (value.is_null_) {
+    expr->locate_datum_for_write(eval_ctx_).set_null();
+  } else if (OB_FILE_TYPE_VARCHAR == value.type_) {
+    /* the value points into the buffer of the scanner, it must be copied out */
+    common::ObDatum src;
+    src.set_string(value.str_val_.ptr(), value.str_val_.length());
+    if (OB_FAIL(expr->deep_copy_datum(eval_ctx_, src))) {
+      LOG_WARN("fail to copy the string of a file table", K(ret));
+    }
+  } else {
+    common::ObObj obj;
+    switch (value.type_) {
+      case OB_FILE_TYPE_BOOLEAN:
+        obj.set_tinyint(static_cast<int8_t>(value.int_val_));
+        break;
+      case OB_FILE_TYPE_BIGINT:
+        obj.set_int(value.int_val_);
+        break;
+      case OB_FILE_TYPE_DOUBLE:
+        obj.set_double(value.double_val_);
+        break;
+      case OB_FILE_TYPE_DATE:
+        obj.set_date(static_cast<int32_t>(value.int_val_));
+        break;
+      case OB_FILE_TYPE_DATETIME:
+        obj.set_datetime(value.int_val_);
+        break;
+      default:
+        ret = OB_ERR_UNEXPECTED;
+        break;
+    }
+    if (OB_SUCC(ret) && OB_FAIL(expr->locate_datum_for_write(eval_ctx_).from_obj(obj))) {
+      LOG_WARN("fail to set the value of a file table", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    expr->set_evaluated_projected(eval_ctx_);
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_file_table()
+{
+  int ret = OB_SUCCESS;
+  ObDatum *value = nullptr;
+  clear_evaluated_flag();
+  if (OB_ISNULL(MY_SPEC.value_expr_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, value))) {
+    LOG_WARN("fail to eval the descriptor of a file table", K(ret));
+  } else if (value->is_null()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the descriptor of a file table is null");
+  } else if (OB_ISNULL(file_iterator_)) {
+    common::ObString desc_str(value->len_, value->ptr_);
+    ObFileTableDescriptor desc;
+    if (OB_FAIL(ObFileTableDescriptor::decode(file_allocator_, desc_str, desc))) {
+      LOG_WARN("fail to decode the descriptor of a file table", K(ret));
+    } else if (OB_FAIL(file_values_.prepare_allocate(desc.column_count()))) {
+      LOG_WARN("fail to allocate the row buffer of a file table", K(ret));
+    } else if (OB_FAIL(ObFileScanUtils::create_iterator(file_allocator_, desc, file_iterator_))) {
+      LOG_WARN("fail to create the iterator of a file table", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    int64_t row_count = 0;
+    if (OB_FAIL(file_iterator_->next_row(&file_values_[0], file_values_.count(), row_count))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("fail to read the next row of a file table", K(ret));
+      }
+    } else if (0 == row_count) {
+      /* the iterator does not produce any row any more */
+      ret = OB_ITER_END;
+    } else {
+      const int64_t column_count = MY_SPEC.column_exprs_.count();
+      const bool has_indexes = MY_SPEC.column_indexes_.count() == column_count;
+      for (int64_t i = 0; OB_SUCC(ret) && i < row_count && i < column_count; ++i) {
+        /* the referenced columns may be a subset of the file schema */
+        const int64_t file_index = has_indexes ? MY_SPEC.column_indexes_.at(i) : i;
+        if (OB_UNLIKELY(file_index < 0 || file_index >= file_values_.count())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the column index of a file table is out of range", K(file_index));
+        } else if (OB_FAIL(set_file_table_column_value(MY_SPEC.column_exprs_.at(i),
+                                                       file_values_[file_index]))) {
+        }
+      }
+    }
   }
   return ret;
 }

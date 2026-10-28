@@ -205,6 +205,16 @@ public:
   int resolve_joined_table_item(const ParseNode &parse_node, JoinedTable *&joined_table);
   int resolve_function_table_item(const ParseNode &table_node,
                                   TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &table_node,
+                              TableItem *&table_item);
+  int resolve_copy_into_item(const ParseNode *into_node,
+                              ObSelectIntoItem &into_item,
+                              bool &has_header);
+  int set_copy_null_text(ObSelectIntoItem &into_item,
+                          const common::ObString &null_text,
+                          const common::ObCollationType cs_type);
+  int resolve_file_table_column_item(const TableItem &table_item,
+                                     ObIArray<ColumnItem> &col_items);
   int resolve_json_table_item(const ParseNode &table_node,
                               TableItem *&table_item);
   int resolve_unnest_item(const ParseNode &table_node, TableItem *&table_item);
@@ -678,6 +688,8 @@ private:
                                              common::ObIArray<ColumnItem> &col_items);
   int resolve_function_table_column_item_sys_func(const TableItem &table_item,
                                                   common::ObIArray<ColumnItem> &col_items);
+  int resolve_file_table_column_items(const TableItem &table_item,
+                                      common::ObIArray<ColumnItem> &col_items);
   int check_table_exist_or_not(uint64_t &database_id,
                                common::ObString &table_name,
                                common::ObString &db_name);

@@ -2265,6 +2265,7 @@ int ObSysVarToObjFuncs::to_obj_default_storage_engine(ObIAllocator &allocator,
   return OB_SUCCESS;
 }
 
+
 int ObSysVarToStrFuncs::to_str_charset(ObIAllocator &allocator,
                                        const ObBasicSessionInfo &session,
                                        const ObBasicSysVar &sys_var,

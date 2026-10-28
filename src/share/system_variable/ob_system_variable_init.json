@@ -10904,6 +10904,19 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Control whether the file table functions (read_csv/read_json/read_ndjson/read_parquet/glob) may be used in this session.",
+    "flags": "GLOBAL | SESSION",
+    "publish_version": "",
+    "info_cn": "控制本会话是否允许使用文件表函数（read_csv/read_json/read_ndjson/read_parquet/glob）",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_ivf_nprobes": {
     "id": 10748,
     "name": "ob_ivf_nprobes",

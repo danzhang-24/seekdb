@@ -20,6 +20,8 @@
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/cmd/ob_show_table_status_sql.h"
 #include "sql/printer/ob_schema_printer.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
+#include "sql/privilege_check/ob_privilege_check.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -150,7 +152,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_ENGINE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OPEN_TABLES)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_USER)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
+            && OB_UNLIKELY(parse_tree.type_ != T_DESC_SELECT)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     real_id = 1;
@@ -1131,13 +1134,19 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
         }();
         break;
       }
+      case T_DESC_SELECT: {
+        show_resv_ctx.stmt_type_ = stmt::T_SHOW_COLUMNS;
+        if (OB_FAIL(resolve_desc_select(parse_tree, select_sql))) {
+          LOG_WARN("fail to resolve the describe select statement", K(ret));
+        }
+        break;
+      }
       default:
         /* won't be here */
         ret = OB_NOT_IMPLEMENT;
         LOG_WARN("not implement type", K(parse_tree.type_));
         break;
-    }
-    if (OB_SUCC(ret)) {
+    }    if (OB_SUCC(ret)) {
       if (OB_FAIL(parse_and_resolve_select_sql(select_sql))) {
       } else if (OB_FAIL(resolve_like_or_where_clause(show_resv_ctx))) {
       }
@@ -1787,6 +1796,228 @@ int ObShowResolver::parse_and_resolve_select_sql(const ObString &select_sql)
     }
   }
 
+  return ret;
+}
+
+/**
+ * Copy a string into a zero terminated buffer, the single quotes are doubled
+ * so that the result may be used as a sql literal.
+ */
+static int escape_sql_literal(common::ObIAllocator &allocator,
+                               const common::ObString &src,
+                               char *&result)
+{
+  int ret = OB_SUCCESS;
+  char *buf = static_cast<char *>(allocator.alloc(src.length() * 2 + 1));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t pos = 0;
+    for (int32_t i = 0; i < src.length(); ++i) {
+      if ('\'' == src.ptr()[i]) {
+        buf[pos++] = '\'';
+      }
+      buf[pos++] = src.ptr()[i];
+    }
+    buf[pos] = '\0';
+    result = buf;
+  }
+  return ret;
+}
+
+/**
+ * Describe the schema of a query, the columns of a file table are described by
+ * the descriptor of the file, so that the inferred type and the nullability of
+ * the file content are reported.
+ */
+int ObShowResolver::collect_desc_columns(ObSelectStmt *inner_stmt,
+                                          common::ObSEArray<common::ObString, 16> &names,
+                                          common::ObSEArray<common::ObString, 16> &types,
+                                          common::ObSEArray<bool, 16> &nullables)
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<SelectItem> &items = inner_stmt->get_select_items();
+  ObArenaAllocator alloc("DescColumn", OB_MALLOC_NORMAL_BLOCK_SIZE);
+  for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+    const SelectItem &item = items.at(i);
+    common::ObString name;
+    common::ObString type_str;
+    bool nullable = true;
+    if (OB_ISNULL(item.expr_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      name = item.alias_name_.length() > 0 ? item.alias_name_ : item.expr_name_;
+      if (item.expr_->is_column_ref_expr()) {
+        ObColumnRefRawExpr *col_ref = static_cast<ObColumnRefRawExpr *>(item.expr_);
+        TableItem *table_item = inner_stmt->get_table_item_by_id(col_ref->get_table_id());
+        if (OB_ISNULL(table_item)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (!table_item->is_file_table()) {
+          type_str = common::ObString(ob_sql_type_str(item.expr_->get_result_type().get_type()));
+          nullable = !item.expr_->get_result_type().is_not_null_for_read();
+        } else {
+          ObFileTableDescriptor desc;
+          ObConstRawExpr *const_expr = static_cast<ObConstRawExpr *>(table_item->function_table_expr_);
+          if (OB_ISNULL(const_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(ObFileTableDescriptor::decode(alloc,
+                                                           const_expr->get_value().get_varchar(),
+                                                           desc))) {
+            LOG_WARN("fail to decode the descriptor of the file table", K(ret));
+          } else {
+            const ObFileColumnSchema *file_col = NULL;
+            for (int64_t j = 0; j < desc.columns_.count(); ++j) {
+              if (desc.columns_.at(j).name_ == col_ref->get_column_name()) {
+                file_col = &desc.columns_.at(j);
+                break;
+              }
+            }
+            if (OB_ISNULL(file_col)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("the column is not found in the descriptor of the file table");
+            } else {
+              type_str = common::ObString(ObFileTypeUtil::type_name(file_col->type_));
+              nullable = file_col->nullable_;
+            }
+          }
+        }
+      } else {
+        type_str = common::ObString(ob_sql_type_str(item.expr_->get_result_type().get_type()));
+        nullable = !item.expr_->get_result_type().is_not_null_for_read();
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(names.push_back(name))
+            || OB_FAIL(types.push_back(type_str))
+            || OB_FAIL(nullables.push_back(nullable))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+/**
+ * The described query is not part of the result statement, so the privileges
+ * it requires are checked here.
+ */
+int ObShowResolver::check_desc_select_priv(ObSelectStmt *inner_stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSessionPrivInfo session_priv;
+  ObArenaAllocator alloc("DescSelectPriv", OB_MALLOC_NORMAL_BLOCK_SIZE);
+  ObSEArray<ObNeedPriv, 4> need_privs;
+  ObStmtNeedPrivs stmt_need_privs(alloc);
+  stmt_need_privs.need_privs_.set_allocator(&alloc);
+  if (OB_FAIL(session_info_->get_session_priv_info(session_priv))) {
+  } else if (OB_FAIL(ObPrivilegeCheck::get_stmt_need_privs(session_priv, inner_stmt, need_privs))) {
+    LOG_WARN("fail to collect the privileges of the described query", K(ret));
+  } else if (OB_FAIL(stmt_need_privs.need_privs_.assign(need_privs))) {
+  } else if (!need_privs.empty()) {
+    ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();
+    if (OB_ISNULL(schema_guard)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(schema_guard->check_priv(session_priv,
+                                                session_info_->get_enable_role_array(),
+                                                stmt_need_privs))) {
+      LOG_WARN("the privileges of the described query are not granted", K(ret));
+    }
+  }
+  return ret;
+}
+
+/**
+ * Build the statement which returns the schema of the described query, the
+ * result is the same as the one of "DESCRIBE SELECT" in duckdb.
+ */
+int ObShowResolver::build_desc_select_sql(const common::ObSEArray<common::ObString, 16> &names,
+                                          const common::ObSEArray<common::ObString, 16> &types,
+                                          const common::ObSEArray<bool, 16> &nullables,
+                                          common::ObString &select_sql)
+{
+  int ret = OB_SUCCESS;
+  /* the length of the fixed part of one result row */
+  static const int64_t ROW_TEMPLATE_LEN = 127;
+  ObArenaAllocator alloc("DescSelectSql", OB_MALLOC_NORMAL_BLOCK_SIZE);
+  ObSEArray<char *, 16> escaped_names;
+  ObSEArray<char *, 16> escaped_types;
+  int64_t need_len = 16;
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    char *name = NULL;
+    char *type_str = NULL;
+    if (OB_FAIL(escape_sql_literal(alloc, names.at(i), name))
+        || OB_FAIL(escape_sql_literal(alloc, types.at(i), type_str))) {
+    } else if (OB_FAIL(escaped_names.push_back(name))
+               || OB_FAIL(escaped_types.push_back(type_str))) {
+    } else {
+      need_len += ROW_TEMPLATE_LEN + 3 + ::strlen(name) + ::strlen(type_str);
+      if (i + 1 < names.count()) {
+        need_len += 11;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    char *buf = static_cast<char *>(params_.allocator_->alloc(need_len));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      int64_t pos = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+        if (OB_FAIL(databuff_printf(buf,
+                                     need_len,
+                                     pos,
+                                     "SELECT '%s' AS `column_name`, '%s' AS `column_type`, "
+                                     "'%s' AS `null`, 'NULL' AS `key`, 'NULL' AS `default`, "
+                                     "'NULL' AS `extra` FROM dual%s",
+                                     escaped_names.at(i),
+                                     escaped_types.at(i),
+                                     nullables.at(i) ? "YES" : "NO",
+                                     i + 1 < names.count() ? " UNION ALL " : ""))) {
+          LOG_WARN("fail to generate the describe statement", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        select_sql.assign_ptr(buf, pos);
+      }
+    }
+  }
+  return ret;
+}
+
+/**
+ * Resolve a "DESCRIBE SELECT ..." statement, the result is the schema of the
+ * described query.
+ */
+int ObShowResolver::resolve_desc_select(const ParseNode &parse_tree, common::ObString &select_sql)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *inner_node = NULL;
+  ObSelectStmt *inner_stmt = NULL;
+  common::ObSEArray<common::ObString, 16> names;
+  common::ObSEArray<common::ObString, 16> types;
+  common::ObSEArray<bool, 16> nullables;
+  if (parse_tree.num_child_ != 1 || OB_ISNULL(inner_node = parse_tree.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_SELECT != inner_node->type_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "the statement described by DESCRIBE");
+  } else {
+    /* the described query is resolved by a dedicated resolver, so that the
+     * state of this resolver is only used by the result statement */
+    ObSelectResolver inner_resolver(params_);
+    inner_resolver.set_calc_found_rows(false);
+    inner_resolver.set_has_top_limit(true);
+    if (OB_FAIL(inner_resolver.resolve(*inner_node))) {
+      LOG_WARN("fail to resolve the described query", K(ret));
+    } else if (OB_ISNULL(inner_stmt = inner_resolver.get_select_stmt())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(check_desc_select_priv(inner_stmt))) {
+    } else if (OB_FAIL(collect_desc_columns(inner_stmt, names, types, nullables))) {
+    } else if (names.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(build_desc_select_sql(names, types, nullables, select_sql))) {
+      LOG_WARN("fail to build the describe statement", K(ret));
+    }
+  }
   return ret;
 }
 

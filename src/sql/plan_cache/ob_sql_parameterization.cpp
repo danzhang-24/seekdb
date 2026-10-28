@@ -96,6 +96,27 @@ struct TraverseStackFrame
                K(cur_node_->type_));
 };
 
+/* the file table function refers to a local file, its path and options are
+ * literals which must be kept in the syntax tree, so the tree of such a
+ * statement is never transformed into the parameterized form. The copy
+ * statement has the same requirement, its path and its options are literals
+ * which are resolved when the statement is resolved. */
+bool has_file_expr(const ParseNode *node)
+{
+  bool has_file = false;
+  if (OB_ISNULL(node)) {
+    // do nothing
+  } else if (T_FILE_TABLE_EXPRESSION == node->type_
+            || T_COPY_INTO_OUTFILE == node->type_) {
+    has_file = true;
+  } else if (OB_NOT_NULL(node->children_)) {
+    for (int64_t i = 0; !has_file && i < node->num_child_; ++i) {
+      has_file = has_file_expr(node->children_[i]);
+    }
+  }
+  return has_file;
+}
+
 }
 }
 
@@ -980,6 +1001,14 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
 
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (has_file_expr(tree)) {
+    /* the file table function refers to a local file, the path and the options
+     * are literals which have to be kept in the syntax tree, so the tree is not
+     * transformed here. The statement is not cached in the plan cache either,
+     * because its schema depends on the content of the file. The copy statement
+     * is handled in the same way, its path and its options are literals too. */
+    if (OB_FAIL(ob_write_string(allocator, pc_ctx.raw_sql_, pc_ctx.sql_ctx_.plan_key_.constructed_sql_))) {
+    }
   } else if (FALSE_IT(reserved_cnt = pc_ctx.fp_result_.raw_params_.count())) {
   } else if (!is_execute_mode(mode)
              && (OB_FAIL(params.reserve(reserved_cnt)) // Reserve array to avoid extending

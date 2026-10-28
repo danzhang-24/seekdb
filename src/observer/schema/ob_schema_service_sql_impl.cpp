@@ -1301,11 +1301,10 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
     for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); i++) {
       ObSysVarClassType sys_var_id = ObSysVariables::get_sys_var_id(i);
       const ObSysVarSchema *sys_var = NULL;
-      if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
-      } else if (OB_ISNULL(sys_var)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
+      if (OB_SUCC(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var)) && OB_NOT_NULL(sys_var)) {
         // sys_var exist, no need to deal with it
+      } else if (OB_FAIL(mock_missed_sys_variable_schema(sys_variable_schema, i, fetch_version))) {
+        ret = OB_ERR_UNEXPECTED;
       }
     }
   }
@@ -1315,6 +1314,32 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
     sys_variable_schema.set_schema_version(fetch_version);
   }
 
+  return ret;
+}
+
+int ObSchemaServiceSQLImpl::mock_missed_sys_variable_schema(
+    ObSysVariableSchema &sys_variable_schema,
+    const int64_t idx,
+    const int64_t schema_version)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator(ObModIds::OB_TEMP_VARIABLES);
+  ObSysVarSchema sysvar_schema(&allocator);
+  if (OB_FAIL(sysvar_schema.set_name(ObSysVariables::get_name(idx)))) {
+  } else if (OB_FAIL(sysvar_schema.set_value(ObSysVariables::get_value(idx)))) {
+  } else if (OB_FAIL(sysvar_schema.set_min_val(ObSysVariables::get_min(idx)))) {
+  } else if (OB_FAIL(sysvar_schema.set_max_val(ObSysVariables::get_max(idx)))) {
+  } else if (OB_FAIL(sysvar_schema.set_info(ObSysVariables::get_info(idx)))) {
+  } else {
+    sysvar_schema.set_data_type(ObSysVariables::get_type(idx));
+    sysvar_schema.set_flags(ObSysVariables::get_flags(idx));
+    sysvar_schema.set_schema_version(schema_version);
+    if (OB_FAIL(sys_variable_schema.add_sysvar_schema(sysvar_schema))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fail to mock the missed system variable schema",
+               K(ret), K(idx), K(ObSysVariables::get_name(idx)));
+    }
+  }
   return ret;
 }
 

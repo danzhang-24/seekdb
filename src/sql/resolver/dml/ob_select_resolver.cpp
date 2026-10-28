@@ -3126,12 +3126,75 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
                                            into_item->pl_vars_,
                                            select_stmt))) {
         }
+      } else if (T_COPY_INTO_OUTFILE == node->type_) { // copy to file
+        bool has_header = false;
+        if (OB_FAIL(resolve_copy_into_item(node, *into_item, has_header))) {
+        } else if (has_header && OB_FAIL(build_copy_header_line(*into_item))) {
+        }
       } else {
         //do nothing
       }
       if (OB_SUCC(ret)) {
         select_stmt->set_select_into(into_item);
       }
+    }
+  }
+  return ret;
+}
+
+/**
+ * The header line of the file which is written by the copy statement. The
+ * names of the columns are separated by the field delimiter and the names
+ * which contain the delimiter are enclosed by the quote character.
+ */
+int ObSelectResolver::build_copy_header_line(ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  ObSelectStmt *select_stmt = get_select_stmt();
+  const char delimiter = into_item.field_str_.get_varchar().length() > 0
+                         ? into_item.field_str_.get_varchar().ptr()[0] : ',';
+  const char quote = into_item.closed_cht_.get_val_len() > 0
+                     ? into_item.closed_cht_.get_char().ptr()[0] : 0;
+  ObSqlString header;
+  if (OB_ISNULL(select_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+    const SelectItem &select_item = select_stmt->get_select_item(i);
+    ObString name = select_item.alias_name_.empty()
+                    ? select_item.expr_name_ : select_item.alias_name_;
+    bool need_enclose = false;
+    for (int64_t j = 0; j < name.length(); ++j) {
+      const char c = name.ptr()[j];
+      if (c == delimiter || c == quote || c == '\n' || c == '\r') {
+        need_enclose = true;
+        break;
+      }
+    }
+    if (i > 0 && OB_FAIL(header.append(&delimiter, 1))) {
+    } else if (need_enclose && 0 != quote) {
+      if (OB_FAIL(header.append(&quote, 1))) {
+      } else {
+        for (int64_t j = 0; OB_SUCC(ret) && j < name.length(); ++j) {
+          if (name.ptr()[j] == quote && OB_FAIL(header.append(&quote, 1))) {
+            break;
+          } else if (OB_SUCC(ret) && OB_FAIL(header.append(&name.ptr()[j], 1))) {
+            break;
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(header.append(&quote, 1))) {
+        }
+      }
+    } else if (OB_FAIL(header.append(name.ptr(), name.length()))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    common::ObString header_str;
+    if (OB_FAIL(ob_write_string(*allocator_,
+                                common::ObString(header.length(), header.ptr()),
+                                header_str))) {
+    } else {
+      into_item.header_line_ = header_str;
     }
   }
   return ret;

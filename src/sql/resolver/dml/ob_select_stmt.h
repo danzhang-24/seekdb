@@ -128,7 +128,10 @@ struct ObSelectIntoItem
         max_file_size_(DEFAULT_MAX_FILE_SIZE),
         escaped_cht_(),
         buffer_size_(DEFAULT_BUFFER_SIZE),
-        external_properties_()
+        external_properties_(),
+        null_str_(),
+        header_line_(),
+        fail_if_exists_(false)
   {
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());
@@ -155,6 +158,9 @@ struct ObSelectIntoItem
     cs_type_ = other.cs_type_;
     buffer_size_ = other.buffer_size_;
     external_properties_ = other.external_properties_;
+    null_str_ = other.null_str_;
+    header_line_ = other.header_line_;
+    fail_if_exists_ = other.fail_if_exists_;
     return user_vars_.assign(other.user_vars_);
   }
   int deep_copy(ObIAllocator &allocator,
@@ -171,7 +177,10 @@ struct ObSelectIntoItem
                K_(escaped_cht),
                K_(cs_type),
                K_(buffer_size),
-               K_(external_properties));
+               K_(external_properties),
+               K_(null_str),
+               K_(header_line),
+               K_(fail_if_exists));
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str
@@ -186,6 +195,9 @@ struct ObSelectIntoItem
   common::ObCollationType cs_type_;
   int64_t buffer_size_;
   common::ObString external_properties_;
+  common::ObObj null_str_; // the text written for a null value
+  common::ObString header_line_; // the header line written before the data
+  bool fail_if_exists_; // the statement fails if the target file exists
 
   static const char* const DEFAULT_FIELD_TERM_STR;
   static const char* const DEFAULT_LINE_TERM_STR;

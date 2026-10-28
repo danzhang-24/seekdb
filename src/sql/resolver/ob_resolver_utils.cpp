@@ -21,6 +21,7 @@
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 
 #include "sql/engine/cmd/ob_load_data_parser.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/code_generator/ob_column_index_provider.h"
@@ -130,6 +131,23 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
   CK (OB_NOT_NULL(package_guard));
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_expr = table_item.function_table_expr_));
+  if ((table_item.is_file_table() || table_expr->is_const_expr())
+      && table_expr->is_const_raw_expr()) {
+    /* a file table function carries the encoded descriptor as its value */
+    const ObConstRawExpr *const_expr = static_cast<const ObConstRawExpr *>(table_expr);
+    const ObObj &const_value = const_expr->get_value();
+    if (ObVarcharType == const_value.get_type()
+        && ObFileTableDescriptor::is_file_descriptor(const_value.get_varchar())) {
+      ObFileTableDescriptor desc;
+      OZ (ObFileTableDescriptor::decode(*params.allocator_,
+                                          const_value.get_varchar(),
+                                          desc));
+      for (int64_t i = 0; OB_SUCC(ret) && i < desc.columns_.count(); ++i) {
+        OZ (column_names.push_back(desc.columns_.at(i).name_));
+      }
+      return ret;
+    }
+  }
   CK (table_expr->get_udt_id() != OB_INVALID_ID);
 
   CK (OB_NOT_NULL(params.schema_checker_));
@@ -1776,6 +1794,10 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       SET_STMT_TYPE(T_ACTIVATE_STANDBY);
       SET_STMT_TYPE(T_SHOW_CREATE_USER);
 #undef SET_STMT_TYPE
+      case T_DESC_SELECT: {
+        type = stmt::T_SHOW_COLUMNS;
+      }
+      break;
       case T_ROLLBACK:
       case T_COMMIT: {
         type = stmt::T_END_TRANS;

@@ -5457,6 +5457,8 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_line_str(), spec.line_str_))) {
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_closed_cht(), spec.closed_cht_))) {
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_escaped_cht(), spec.escaped_cht_))) {
+  } else if (OB_FAIL(deep_copy_obj(alloc, op.get_null_str(), spec.null_str_))) {
+  } else if (OB_FAIL(deep_copy_obj(alloc, op.get_header_line(), spec.header_line_))) {
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
@@ -5486,6 +5488,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.cs_type_ = op.get_cs_type();
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
+      spec.fail_if_exists_ = op.get_fail_if_exists();
       spec.plan_->need_drive_dml_query_ = true;
     }
   }
@@ -5502,7 +5505,8 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
   int ret = OB_SUCCESS;
   if (OB_ISNULL(op.get_stmt())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(spec.column_exprs_.init(op.get_stmt()->get_column_size()))) {
+  } else if (OB_FAIL(spec.column_exprs_.init(op.get_stmt()->get_column_size()))
+           || OB_FAIL(spec.column_indexes_.init(op.get_stmt()->get_column_size()))) {
   } else if (OB_UNLIKELY(op.get_num_of_child() > 1)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(value_raw_expr = op.get_value_expr())) {
@@ -5511,6 +5515,15 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
   } else {
     spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
     spec.value_expr_ = value_expr;
+    if (value_raw_expr->is_const_expr()) {
+      /* a file table function carries the encoded descriptor as its value */
+      const ObConstRawExpr *const_expr = static_cast<const ObConstRawExpr *>(value_raw_expr);
+      const common::ObObj &const_value = const_expr->get_value();
+      if (ObVarcharType == const_value.get_type()
+          && ObFileTableDescriptor::is_file_descriptor(const_value.get_varchar())) {
+        spec.is_file_table_ = true;
+      }
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {
       }
@@ -5526,6 +5539,10 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
+        if (spec.is_file_table_) {
+          /* the columns of a file table are resolved in the order of the file schema */
+          OZ (spec.column_indexes_.push_back(col_item->column_id_ - common::OB_APP_MIN_COLUMN_ID));
+        }
       }
     }
   }

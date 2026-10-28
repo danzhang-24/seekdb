@@ -44,7 +44,10 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        null_str_(),
+        header_line_(),
+        fail_if_exists_(false)
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -108,6 +111,21 @@ public:
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
   }
+  inline void set_null_str(const common::ObObj &null_str)
+  {
+    null_str_ = null_str;
+  }
+  inline void set_header_line(const common::ObString &header_line)
+  {
+    if (!header_line.empty()) {
+      header_line_.set_varchar(header_line);
+      header_line_.set_collation_type(cs_type_);
+    }
+  }
+  inline void set_fail_if_exists(const bool fail_if_exists)
+  {
+    fail_if_exists_ = fail_if_exists;
+  }
   inline ObItemType get_into_type() const
   {
     return into_type_;
@@ -164,6 +182,18 @@ public:
   {
     return external_properties_;
   }
+  inline common::ObObj get_null_str() const
+  {
+    return null_str_;
+  }
+  inline common::ObObj get_header_line() const
+  {
+    return header_line_;
+  }
+  inline bool get_fail_if_exists() const
+  {
+    return fail_if_exists_;
+  }
   const common::ObIArray<ObRawExpr*> &get_select_exprs() const { return select_exprs_; }
   common::ObIArray<ObRawExpr*> &get_select_exprs() { return select_exprs_; }
   virtual int est_cost() override;
@@ -188,6 +218,9 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  common::ObObj null_str_;
+  common::ObObj header_line_;
+  bool fail_if_exists_;
 };
 }
 }
