@@ -103,6 +103,14 @@ public:
 
   int process(TokenizeContext &ctx);
 
+  // The current character is the same for every segmenter, so the parser reads
+  // it once and hands it down instead of letting each segmenter read it back
+  // from the context.
+  int process(TokenizeContext &ctx,
+              const char *ch,
+              const uint8_t char_len,
+              const ObFTCharUtil::CharType type);
+
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,

@@ -46,6 +46,14 @@ int ObIIKProcessor::process(TokenizeContext &ctx)
   return ret;
 }
 
+int ObIIKProcessor::process(TokenizeContext &ctx,
+                            const char *ch,
+                            const uint8_t char_len,
+                            const ObFTCharUtil::CharType type)
+{
+  return do_process(ctx, ch, char_len, type);
+}
+
 TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  ObIAllocator &allocator,
                                  const char *fulltext,
