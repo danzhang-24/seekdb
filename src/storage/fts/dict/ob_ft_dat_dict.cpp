@@ -258,9 +258,7 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_FAIL(map->find(ft_char, code)) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -301,16 +299,28 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
+  return find(word.word, word.word_len, code);
+}
+
+int ObArrayHashMap::find(const ObString &word, ObFTWordCode &code) const
+{
+  return find(word.ptr(), word.length(), code);
+}
+
+int ObArrayHashMap::find(const char *word, int32_t word_len, ObFTWordCode &code) const
+{
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.hash();
-  uint64_t index = hash % header_.capacity_;
+  uint64_t hash = ObFTSingleWord::hash(word, word_len);
+  uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = hash & mask;
   while (header_.data[index].used) {
-    if (header_.data[index].word == word) {
+    if (header_.data[index].word.word_len == word_len
+        && 0 == MEMCMP(header_.data[index].word.word, word, word_len)) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = (index + 3) & mask;
     }
   }
   return ret;
@@ -320,9 +330,10 @@ int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
   uint64_t hash = ObFTSingleWord::hash(key.ptr(), key.length());
-  uint64_t index = hash % header_.capacity_;
+  uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = hash & mask;
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index = (index + 3) & mask;
   }
 
   header_.data[index].code = code;
@@ -354,8 +365,12 @@ size_t ObArrayHashMap::estimate_size(size_t word_num)
 
 size_t ObArrayHashMap::estimate_capacity(size_t word_num)
 {
-  constexpr size_t MIN_CAPACITY = 101;                   // prime
-  size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
+  constexpr size_t MIN_CAPACITY = 101;
+  size_t required = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
+  size_t capacity = 1;
+  while (capacity < required) {
+    capacity <<= 1;
+  }
   return capacity;
 }
 } //  namespace storage
