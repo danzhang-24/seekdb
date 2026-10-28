@@ -25,16 +25,29 @@ namespace oceanbase
 namespace storage
 {
 
+inline int compare_binary_datum(const ObDatum &lhs, const ObDatum &rhs)
+{
+  const ObString &lhs_str = lhs.get_string();
+  const ObString &rhs_str = rhs.get_string();
+  const int64_t min_len = MIN(lhs_str.length(), rhs_str.length());
+  int cmp_ret = MEMCMP(lhs_str.ptr(), rhs_str.ptr(), min_len);
+  if (0 == cmp_ret) {
+    cmp_ret = static_cast<int>(lhs_str.length() - rhs_str.length());
+  }
+  return cmp_ret;
+}
+
 class ObDomainIdCmp
 {
 public:
-  ObDomainIdCmp() : cmp_func_(nullptr) {}
+  ObDomainIdCmp() : cmp_func_(nullptr), is_binary_(false) {}
   ~ObDomainIdCmp() {}
   inline int init(const ObObjMeta &obj_meta);
   inline int compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret) const;
-  inline void reset() { cmp_func_ = nullptr; }
+  inline void reset() { cmp_func_ = nullptr; is_binary_ = false; }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  bool is_binary_;
   DISALLOW_COPY_AND_ASSIGN(ObDomainIdCmp);
 };
 
@@ -52,6 +65,8 @@ int ObDomainIdCmp::init(const ObObjMeta &obj_meta)
       STORAGE_LOG(WARN,"failed to get basic functions", K(ret), K(obj_meta));
     } else {
       cmp_func_ = id_basic_funcs->null_first_cmp_;
+      is_binary_ = ob_is_string_type(obj_meta.get_type())
+          && CS_TYPE_BINARY == obj_meta.get_collation_type();
     }
   }
   return ret;
@@ -78,6 +93,8 @@ int ObDomainIdCmp::compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret)
     } else {
       ret = OB_ERR_UNEXPECTED;
     }
+  } else if (is_binary_ && !lhs.is_null() && !rhs.is_null()) {
+    cmp_ret = compare_binary_datum(lhs, rhs);
   } else {
     ret = cmp_func_(lhs, rhs, cmp_ret, nullptr);
   }
