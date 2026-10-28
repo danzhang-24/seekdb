@@ -66,8 +66,11 @@ public:
   int insert(const ObString &key, ObFTWordCode code);
 
   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
+  int find(const ObString &word, ObFTWordCode &code) const;
 
 private:
+  int find(const char *word, int32_t word_len, ObFTWordCode &code) const;
+
   struct Header header_;
 } __attribute__((packed));
 
