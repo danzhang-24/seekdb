@@ -29,6 +29,29 @@ inline int compare_binary_datum(const ObDatum &lhs, const ObDatum &rhs)
 {
   const ObString &lhs_str = lhs.get_string();
   const ObString &rhs_str = rhs.get_string();
+  if (OB_LIKELY(16 == lhs_str.length() && 16 == rhs_str.length())) {
+    uint64_t lhs_high = 0;
+    uint64_t lhs_low = 0;
+    uint64_t rhs_high = 0;
+    uint64_t rhs_low = 0;
+    MEMCPY(&lhs_high, lhs_str.ptr(), sizeof(lhs_high));
+    MEMCPY(&lhs_low, lhs_str.ptr() + sizeof(lhs_high), sizeof(lhs_low));
+    MEMCPY(&rhs_high, rhs_str.ptr(), sizeof(rhs_high));
+    MEMCPY(&rhs_low, rhs_str.ptr() + sizeof(rhs_high), sizeof(rhs_low));
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    lhs_high = __builtin_bswap64(lhs_high);
+    lhs_low = __builtin_bswap64(lhs_low);
+    rhs_high = __builtin_bswap64(rhs_high);
+    rhs_low = __builtin_bswap64(rhs_low);
+#endif
+    if (lhs_high != rhs_high) {
+      return lhs_high < rhs_high ? -1 : 1;
+    }
+    if (lhs_low != rhs_low) {
+      return lhs_low < rhs_low ? -1 : 1;
+    }
+    return 0;
+  }
   const int64_t min_len = MIN(lhs_str.length(), rhs_str.length());
   int cmp_ret = MEMCMP(lhs_str.ptr(), rhs_str.ptr(), min_len);
   if (0 == cmp_ret) {
