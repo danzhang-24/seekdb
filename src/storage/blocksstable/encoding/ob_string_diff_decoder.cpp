@@ -84,8 +84,8 @@ int ObStringDiffDecoder::decode(const ObColumnDecoderCtx &ctx, common::ObDatum &
 
     char *buf = NULL;
     if (OB_SUCC(ret)) {
-      const static uint16_t min_buf_size = 128;
-      const int64_t buf_size = std::max(header_->string_size_, min_buf_size);
+      const int64_t buf_size = (std::max(header_->string_size_, static_cast<uint16_t>(1)) + sizeof(uint64_t) - 1)
+          & ~(sizeof(uint64_t) - 1);
       if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
@@ -159,8 +159,8 @@ int ObStringDiffDecoder::batch_decode(
 
     // Fill string data
     const uint16_t string_size = header_->string_size_;
-    const static uint16_t min_buf_size = 128;
-    const int64_t buf_size = std::max(string_size, min_buf_size);
+    const int64_t buf_size = (std::max(string_size, static_cast<uint16_t>(1)) + sizeof(uint64_t) - 1)
+        & ~(sizeof(uint64_t) - 1);
     char *buf = nullptr;
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size * row_cap)))) {
