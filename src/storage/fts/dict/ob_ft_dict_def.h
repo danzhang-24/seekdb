@@ -42,6 +42,8 @@ public:
 
   int32_t set_word(const char *word, int32_t word_len);
   ObString get_word() const;
+  uint64_t hash() const;
+  static uint64_t hash(const char *word, int32_t word_len);
   bool operator==(const ObFTSingleWord &other) const;
 
 public:

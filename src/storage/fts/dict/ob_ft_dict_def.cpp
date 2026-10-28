@@ -22,6 +22,24 @@ namespace storage
 {
 
 common::ObString ObFTSingleWord::get_word() const { return ObString(word_len, word); }
+
+uint64_t ObFTSingleWord::hash(const char *word, int32_t word_len)
+{
+  constexpr uint64_t FNV_OFFSET_BASIS = 1469598103934665603ULL;
+  constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+  uint64_t hash_val = FNV_OFFSET_BASIS ^ static_cast<uint64_t>(word_len);
+  for (int32_t i = 0; i < word_len; ++i) {
+    hash_val ^= static_cast<unsigned char>(word[i]);
+    hash_val *= FNV_PRIME;
+  }
+  return hash_val;
+}
+
+uint64_t ObFTSingleWord::hash() const
+{
+  return hash(word, word_len);
+}
+
 bool ObFTSingleWord::operator==(const ObFTSingleWord &other) const
 {
   return (this == &other)
