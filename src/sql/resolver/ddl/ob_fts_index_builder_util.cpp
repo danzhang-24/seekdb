@@ -1049,12 +1049,10 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
         // The FTS aux table build is CPU bound on tokenization and on the sort of
-        // the generated rows. With the default DDL parallelism of one the other
-        // cores stay idle, so the decided parallelism has a floor of two. The
-        // floor is bounded by the number of usable CPUs so that a single core
-        // machine still builds the index with a single worker.
+        // the generated rows. Use up to four workers so that the other cores do
+        // not stay idle, while retaining the single-core behavior on small hosts.
         decided_parallelism = MAX(MAX(original_parallelism / 3, 1L),
-                                  MIN(2L, get_cpu_num()));
+                                  MIN(4L, get_cpu_num()));
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
