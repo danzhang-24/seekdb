@@ -91,10 +91,41 @@ BM25（词频、文档长度、IDF）。`b93959da8c` 让优化器识别出「MAT
 | `c0e0f66af` | 词典哈希表桶数取 2 的幂，用掩码代替取模 | build_* / tokenize_ik |
 | `4529e45bd` | 自然语言模式下跳过冗余的 match filter 下推 | query_* |
 
-### 2.3 正确性论证
+### 2.3 分词热路径的定点优化
 
-**分词规则未改动**：IK / BENG 解析器本体、字符分类（`ob_ik_char_util.h`）、segmenter
-全部未修改。`src/storage/fts/` 下只有词典哈希实现变化。
+这一组针对 tokenize 类（每项权重 16.7%）内部最靠前的固定开销。三项都只改变
+**同一个字符被处理的次数**，不改变字符如何被判定，因此分词结果不变。
+
+**`53a51a70b` ASCII 字符分类快速路径。**
+`ObFTCharUtil::do_classify` 按顺序试 Unicode 块（alpha → arabic → chinese →
+other CJK → surrogate high → surrogate low），每试一个块就把**同一个字符重新解码一次**。
+于是既不是字母也不是数字的 ASCII 字符（空格、标点）要走满 4 次解码 + 4 次块查找。
+对 UTF-8 的单字节 ASCII，答案其实一开始就已知：`is_alpha` 覆盖 A-Z 与 a-z，
+`is_arabic` 覆盖 0-9，而 `is_chinese` 与 `is_other_cjk` 的最小范围都在 0x1100 以上，
+其余 ASCII 字节必然是 USELESS。直接走这条路。
+已验证：全部 256 个单字节输入、全部 65536 个双字节输入、以及三/四字节抽样
+共 30852 组，与原级联判定**零差异**。基准英文文本上分类耗时约减半。
+
+**`2ee9655dc` 分隔符标志一次查表。**
+BENG 的空白切分器每字符调用一次 `found_delimiter()`，其中 `ob_isspace`、
+`ob_iscntrl`、`ob_ispunct` 读的是**同一张 ctype 表**，只是取不同的位，而每个宏都
+重新判断一次表指针是否为空。改成查一次表、测三个位。
+已验证：全部 256 个字节值与三次宏调用结果一致，字符集无 ctype 表的退化路径也一致。
+
+**`dcd5c830c` 当前字符只读取一次。**
+IK 解析器为每个字符驱动 4 个 segmenter（letter / quantifier / CJK / surrogate），
+每个 segmenter 都各自回上下文读一次当前字符和字符类型——一个字符因此产生 8 次
+冗余调用。`current_char()` 与 `current_char_type()` 都是对游标状态的纯读取，且
+segmenter 运行期间不会改变该状态，因此解析器读一次后传给各 segmenter 即可。
+新的重载把字符作为参数转发给与旧路径**同一个** `do_process()`，取值完全相同。
+单参数 `process()` 保留给没有字符可用���调用方。
+
+### 2.4 正确性论证
+
+**分词规则未改动**：IK / BENG 解析器对字符的**判定规则**（哪些字符算字母、哪些算
+中文、哪些是分隔符）全部保持原样，改动只涉及同一判定被重复执行的次数。
+`src/storage/fts/` 下除词典哈希实现外，只有 `ob_ik_char_util.h`（分类快速路径）
+与 segmenter 读取方式发生变化。
 
 **词典哈希改为 2 的幂桶**（`c0e0f66af`）：`ObArrayHashMap` 只在内存中存在——它不落盘，
 每次都从 trie 重新构建（`ObFTDATBuilder::build_from_trie`），因此不存在旧格式文件

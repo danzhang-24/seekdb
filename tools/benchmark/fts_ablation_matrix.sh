@@ -47,6 +47,9 @@ VARIANTS=(
   "queryonly-known-good:perf/fts-queryonly-known-good"
   "prefixclone:perf/fts-prefixclone"
   "tokenize-parser-props-cache:perf/fts-tokenize-parser-props-cache"
+  # The candidate without the tokenizer hot path work, to size that work on
+  # its own. Points at the commit right before it.
+  "candidate-no-tokenize:b64e8a4e5bfea767e6de9c15c1f9d743d145533b"
 )
 
 if [[ $# -gt 0 ]]; then
@@ -68,6 +71,27 @@ mkdir -p "${BUILD_ROOT}" "${OUT_DIR}"
 
 log() { echo "$@" >&2; }
 
+# Resolve a variant reference to a commit. The experiment branches only exist
+# on the remote, so fall back to the remote-tracking ref; fetch it if the
+# clone does not have it yet.
+resolve_ref() {
+  local ref="$1"
+  if git -C "${REPO_ROOT}" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+    git -C "${REPO_ROOT}" rev-parse "${ref}^{commit}"
+    return 0
+  fi
+  local remote_ref="origin/${ref}"
+  if git -C "${REPO_ROOT}" rev-parse --verify --quiet "${remote_ref}^{commit}" >/dev/null 2>&1; then
+    git -C "${REPO_ROOT}" rev-parse "${remote_ref}^{commit}"
+    return 0
+  fi
+  # Try to fetch it from the origin remote.
+  if git -C "${REPO_ROOT}" fetch --quiet origin "+refs/heads/${ref}:refs/remotes/origin/${ref}" 2>/dev/null; then
+    git -C "${REPO_ROOT}" rev-parse "${remote_ref}^{commit}" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
 # Build one variant into its own build directory. The observer binary is the
 # only artifact the benchmark needs.
 build_variant() {
@@ -77,11 +101,16 @@ build_variant() {
     log "  reuse build: ${dir}"
     return 0
   fi
-  log "  building ${name} from ${ref} ..."
+  local commit
+  commit="$(resolve_ref "${ref}")" || {
+    log "  CANNOT RESOLVE ${ref}"
+    return 1
+  }
+  log "  building ${name} from ${ref} (${commit:0:10}) ..."
   rm -rf "${dir}"
-  git -C "${REPO_ROOT}" worktree add --detach "${dir}" "${ref}" >/dev/null 2>&1 || {
+  git -C "${REPO_ROOT}" worktree add --detach "${dir}" "${commit}" >/dev/null 2>&1 || {
     git -C "${REPO_ROOT}" worktree prune
-    git -C "${REPO_ROOT}" worktree add --detach "${dir}" "${ref}" >/dev/null
+    git -C "${REPO_ROOT}" worktree add --detach "${dir}" "${commit}" >/dev/null
   }
   # The worktree shares the repository, so the benchmark script and the scoring
   # script are already present at their expected paths.
