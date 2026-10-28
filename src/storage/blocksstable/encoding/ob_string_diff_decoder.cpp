@@ -166,9 +166,10 @@ int ObStringDiffDecoder::batch_decode(
     } else if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size * row_cap)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
-      for (int64_t i = 0; i < row_cap; ++i) {
-        header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
-            header_->common_data(), buf + i * buf_size);
+      header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+          header_->common_data(), buf);
+      for (int64_t i = 1; i < row_cap; ++i) {
+        MEMCPY(buf + i * buf_size, buf, string_size);
       }
     }
 
