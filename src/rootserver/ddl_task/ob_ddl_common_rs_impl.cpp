@@ -344,6 +344,7 @@ int ObDDLTaskUtil::generate_build_replica_sql(const int64_t data_table_id,
     ObArray<int64_t> order_column_ids;
     bool is_shadow_column = false;
     const int64_t real_parallelism = ObDDLTaskUtil::get_real_parallelism(parallelism);
+    const char *enable_newsort = is_fts_index(dest_table_schema->get_index_type()) ? "true" : "false";
     const bool is_rowkey_doc_aux_table = dest_table_schema->is_rowkey_doc_id();
     uint64_t doc_id_col_id = OB_INVALID_ID;
     uint64_t ft_id_col_id = OB_INVALID_ID;
@@ -534,8 +535,8 @@ int ObDDLTaskUtil::generate_build_replica_sql(const int64_t data_table_id,
         }
         if (OB_FAIL(ret)) {
         } else {
-          if (OB_FAIL(sql_string.assign_fmt("INSERT /*+ enable_parallel_dml parallel(%ld) opt_param('ddl_execution_id', %ld) opt_param('ddl_task_id', %ld) opt_param('enable_newsort', 'false') %.*s use_px */INTO `%.*s`.`%.*s` %.*s(%.*s) SELECT /*+ index(`%.*s` primary) %.*s */ %.*s from `%.*s`.`%.*s` %.*s as of snapshot %ld %.*s",
-              real_parallelism, execution_id, task_id,
+          if (OB_FAIL(sql_string.assign_fmt("INSERT /*+ enable_parallel_dml parallel(%ld) opt_param('ddl_execution_id', %ld) opt_param('ddl_task_id', %ld) opt_param('enable_newsort', '%s') %.*s use_px */INTO `%.*s`.`%.*s` %.*s(%.*s) SELECT /*+ index(`%.*s` primary) %.*s */ %.*s from `%.*s`.`%.*s` %.*s as of snapshot %ld %.*s",
+              real_parallelism, execution_id, task_id, enable_newsort,
               static_cast<int>(strlen(io_read_hint)), io_read_hint,
               static_cast<int>(new_dest_database_name.length()), new_dest_database_name.ptr(), static_cast<int>(new_dest_table_name.length()), new_dest_table_name.ptr(),
               static_cast<int>(partition_names.length()), partition_names.ptr(),
