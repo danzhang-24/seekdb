@@ -448,6 +448,27 @@ inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, 
   bool checker = false;
   type = CharType::USELESS;
 
+  // Fast path for a single byte ASCII character (UTF-8 only). The cascade below
+  // decodes the same character once per Unicode block it tests, so an ASCII
+  // character that is neither a letter nor a digit used to be decoded and
+  // block-tested up to four times per character. For ASCII the answer is known
+  // up front: is_alpha covers A-Z and a-z, is_arabic covers 0-9, and neither
+  // is_chinese nor is_other_cjk has any range below 0x1100, so every other
+  // ASCII byte is USELESS.
+  if (CS_TYPE == CHARSET_UTF8MB4 && 1 == char_len) {
+    const unsigned char c = static_cast<unsigned char>(input[0]);
+    if (c < 0x80) {
+      if (('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')) {
+        type = CharType::ENGLISH_LETTER;
+      } else if ('0' <= c && c <= '9') {
+        type = CharType::ARABIC_LETTER;
+      } else {
+        type = CharType::USELESS;
+      }
+      return ret;
+    }
+  }
+
   if (OB_FAIL(is_alpha<CS_TYPE>(input, char_len, checker))) {
   } else if (checker) {
     type = CharType::ENGLISH_LETTER;
