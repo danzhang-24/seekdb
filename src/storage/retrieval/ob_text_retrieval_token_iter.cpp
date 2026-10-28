@@ -415,6 +415,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
+    is_binary_id_(false),
     skip_bm25_eval_(false),
     is_inited_(false)
 {
@@ -438,8 +439,12 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       skip_bm25_eval_ = iter_param.skip_bm25_eval_;
       inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
-      common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
+      const ObDatumMeta &id_meta = inv_scan_domain_id_col_->datum_meta_;
+      common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(
+          id_meta.get_type(), id_meta.cs_type_);
       cmp_func_ = basic_funcs->null_first_cmp_;
+      is_binary_id_ = ob_is_string_type(id_meta.get_type())
+          && CS_TYPE_BINARY == id_meta.cs_type_;
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
@@ -562,11 +567,15 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   }
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
-      if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
-      } else if (result <= 0) {
+      const ObDatum &curr_id = doc_id_[cur_idx_].get_datum();
+      if (is_binary_id_ && !id_datum.is_null() && !curr_id.is_null()) {
+        result = compare_binary_datum(id_datum, curr_id);
+      } else if (OB_FAIL(cmp_func_(
+                     id_datum, curr_id, result, nullptr))) {
+      }
+      if (OB_SUCC(ret) && result <= 0) {
         find = true;
-      } else {
+      } else if (OB_SUCC(ret)) {
         ++cur_idx_;
       }
     } else if (OB_FAIL(token_iter_->advance_to(id_datum))) {
@@ -577,12 +586,18 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
       }
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(cmp_func_(
-                   id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
-    } else if (result <= 0) {
-      find = true;
     } else {
-      ret = OB_ERR_UNEXPECTED;
+      const ObDatum &curr_id = doc_id_[cur_idx_].get_datum();
+      if (is_binary_id_ && !id_datum.is_null() && !curr_id.is_null()) {
+        result = compare_binary_datum(id_datum, curr_id);
+      } else if (OB_FAIL(cmp_func_(
+                     id_datum, curr_id, result, nullptr))) {
+      }
+      if (OB_SUCC(ret) && result <= 0) {
+        find = true;
+      } else if (OB_SUCC(ret)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
     }
   }
   return ret;
