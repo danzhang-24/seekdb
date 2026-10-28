@@ -18,6 +18,8 @@
 
 #include "share/text_analysis/ob_token_stream.h"
 #include "share/rc/ob_server_runtime.h"
+// For the ctype table used by found_delimiter() (_MY_SPC / _MY_CTR / _MY_PNT).
+#include "lib/charset/ob_ctype.h"
 
 namespace oceanbase
 {
@@ -138,7 +140,20 @@ bool ObTextWhitespaceTokenizer::found_delimiter()
 {
   bool found = false;
   const char *curr_char = input_doc_->ptr_ + trav_pos_;
-  found = ob_isspace(cs_, *curr_char) || ob_iscntrl(cs_, *curr_char) || ob_ispunct(cs_, *curr_char);
+  // ob_isspace, ob_iscntrl and ob_ispunct all read the same ctype table and
+  // only differ in the bit they test, but each macro re-tests the table
+  // pointer for null. This runs once per character of the document, so look
+  // the byte up once and test the three bits together.
+  const unsigned char *ctype = nullptr;
+  if (nullptr != cs_ && nullptr != cs_->ctype) {
+    ctype = cs_->ctype + 1;
+  }
+  if (nullptr != ctype) {
+    const unsigned char flags = ctype[static_cast<unsigned char>(*curr_char)];
+    found = (flags & (_MY_SPC | _MY_CTR | _MY_PNT)) != 0;
+  } else {
+    found = ob_isspace(cs_, *curr_char) || ob_iscntrl(cs_, *curr_char) || ob_ispunct(cs_, *curr_char);
+  }
   return found;
 }
 
